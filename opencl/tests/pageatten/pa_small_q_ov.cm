@@ -79,9 +79,9 @@ namespace KERNEL_NAME {
 //#else
 //    #define ONLINE_TILE_STEPS 8
 //#endif
-#define ONLINE_TILE_STEPS 4
+#define ONLINE_TILE_STEPS 8
 #define ONLINE_TILE_SIZE (ONLINE_TILE_STEPS * KV_STEP)
-#define NUM_ONLINE_TILES (KV_PARTITION_STEP_NUM / ONLINE_TILE_STEPS)
+#define NUM_ONLINE_TILES ((KV_PARTITION_STEP_NUM + ONLINE_TILE_STEPS - 1) / ONLINE_TILE_STEPS)
 
 #if KV_CACHE_COMPRESSION
     #if KV_CACHE_COMPRESSION == 2
@@ -279,7 +279,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 #else
     constexpr uint VALUE_TILE_NUM = 1;
 #endif
-
     #pragma unroll
     for (int online_tile = 0; online_tile < NUM_ONLINE_TILES; online_tile++) {
         const int tile_kv_start = online_tile * ONLINE_TILE_SIZE;
@@ -312,16 +311,27 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             uint block_start_in_partition = block_idx * KV_BLOCK_SIZE;
             uint kv_pos_begin_in_block = (tile_kv_start > (int)block_start_in_partition)
                                          ? (tile_kv_start - (int)block_start_in_partition) : 0;
-            uint kv_pos_end_in_block = KV_BLOCK_SIZE;
-            if (block_idx == block_num - 1 && leftover_size > 0) {
-                kv_pos_end_in_block = leftover_size % KV_BLOCK_SIZE;
-                if (kv_pos_end_in_block == 0) kv_pos_end_in_block = KV_BLOCK_SIZE;
+            // Derive the per-block bound from the partition's valid column count rather than
+            // from "is this the partition's last block". The latter breaks once a partition spans
+            // more than one block (KV_PARTITION_SIZE / KV_BLOCK_SIZE is 8 for the legacy 16-token
+            // block, 1 only for xattention): block_num comes from the block table, i.e. the whole
+            // subsequence, while leftover_size comes from this tile's causal cap kv_len_max, which
+            // can end in an earlier block. Blocks in between were then treated as full, so the K/V
+            // tail below was never zeroed and stale cache rows reached the DPAS - where P is 0 but
+            // 0 * NaN is NaN, poisoning the whole accumulator.
+            const uint partition_valid = (leftover_size > 0) ? leftover_size : (uint)KV_PARTITION_SIZE;
+            uint kv_pos_end_in_block = 0;
+            if (partition_valid > block_start_in_partition) {
+                kv_pos_end_in_block = partition_valid - block_start_in_partition;
+                if (kv_pos_end_in_block > KV_BLOCK_SIZE)
+                    kv_pos_end_in_block = KV_BLOCK_SIZE;
             }
             uint tile_end_in_partition = tile_kv_start + ONLINE_TILE_SIZE;
             if (block_start_in_partition + kv_pos_end_in_block > tile_end_in_partition)
                 kv_pos_end_in_block = tile_end_in_partition - block_start_in_partition;
             uint effective_kv_pos_end = kv_pos_end_in_block;
-
+            if (effective_kv_pos_end == 0)
+                continue;
 #if KV_CACHE_COMPRESSION == 1
             vector<half, KV_BLOCK_SIZE> scale_vec;
             vector<half, KV_BLOCK_SIZE> zp_vec;
@@ -561,12 +571,11 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 }
             }
 
-            // Also mask columns beyond kv_pos_end for the last tile
+            // Also mask columns beyond this partition's valid KV extent.
             {
-                uint partition_kv_pos_end = KV_BLOCK_SIZE;  // = kv_pos_end for single block
-                if (leftover_size > 0) {
-                    partition_kv_pos_end = leftover_size % KV_BLOCK_SIZE;
-                    if (partition_kv_pos_end == 0) partition_kv_pos_end = KV_BLOCK_SIZE;
+                uint partition_kv_pos_end = KV_PARTITION_SIZE;
+                if (kv_partition_idx == seq_kv_partition_num - 1 && leftover_size > 0) {
+                    partition_kv_pos_end = leftover_size;
                 }
                 // Mask tile columns beyond the valid range
                 #pragma unroll
@@ -657,16 +666,21 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             uint block_start_in_partition_v = block_idx * KV_BLOCK_SIZE;
             uint kv_pos_begin_in_block_v = (tile_kv_start > (int)block_start_in_partition_v)
                                            ? (tile_kv_start - (int)block_start_in_partition_v) : 0;
-            uint kv_pos_end_in_block_v = KV_BLOCK_SIZE;
-            if (block_idx == block_num - 1 && leftover_size > 0) {
-                kv_pos_end_in_block_v = leftover_size % KV_BLOCK_SIZE;
-                if (kv_pos_end_in_block_v == 0) kv_pos_end_in_block_v = KV_BLOCK_SIZE;
+            // Same fix as for K: derive per-block bound from partition's valid column count,
+            // not from "is this the last block" (breaks with multi-block partitions).
+            const uint partition_valid_v = (leftover_size > 0) ? leftover_size : (uint)KV_PARTITION_SIZE;
+            uint kv_pos_end_in_block_v = 0;
+            if (partition_valid_v > block_start_in_partition_v) {
+                kv_pos_end_in_block_v = partition_valid_v - block_start_in_partition_v;
+                if (kv_pos_end_in_block_v > KV_BLOCK_SIZE)
+                    kv_pos_end_in_block_v = KV_BLOCK_SIZE;
             }
             uint tile_end_in_partition_v = tile_kv_start + ONLINE_TILE_SIZE;
             if (block_start_in_partition_v + kv_pos_end_in_block_v > tile_end_in_partition_v)
                 kv_pos_end_in_block_v = tile_end_in_partition_v - block_start_in_partition_v;
             uint effective_kv_pos_end = kv_pos_end_in_block_v;
-
+            if (effective_kv_pos_end == 0)
+                continue;
 #if KV_CACHE_COMPRESSION
             vector<half, KV_BLOCK_SIZE> scale_vec;
             vector<half, KV_BLOCK_SIZE> zp_vec;

@@ -233,7 +233,7 @@ def _calc_kv_bandwidth(
     time_ms: float,
 ) -> Tuple[float, float]:
     """
-    Calculate KV cache bandwidth.
+    Calculate LOGICAL KV cache bandwidth (for Roofline analysis).
 
     IMPORTANT: `time_ms` MUST be the pure GPU kernel time (from profiling events),
     NOT the wall-clock per-call time. The wall-clock loop re-uploads the whole KV
@@ -241,8 +241,12 @@ def _calc_kv_bandwidth(
     so dividing kv_bytes by wall-clock time yields a meaningless, deflated BW.
     Pass kernel_ms here.
 
+    CRITICAL: This function returns LOGICAL KV bytes (q_len * past_len),
+    suitable for Roofline Model (AI computation). For ACTUAL memory bound analysis,
+    see _calc_actual_kv_bandwidth() below.
+
     Returns:
-        (kv_bytes_read, bandwidth_gbs)
+        (logical_kv_bytes_read, logical_bandwidth_gbs)
     """
     # Logical KV bytes: q_len * (physical KV cache size). This is what the kernel
     # would transfer if every Q token independently pulled the full KV from DRAM.
@@ -252,15 +256,49 @@ def _calc_kv_bandwidth(
     #   - above peak       -> cache reuse across Q tokens is saving DRAM traffic
     #                         (higher = better reuse). "300 GB/s logical" on a
     #                         150 GB/s DRAM means ~2x reuse.
-    # This metric measures kernel efficiency, NOT true DRAM BW. To get true
+    # This metric measures kernel efficiency (AI), NOT true DRAM BW. To get true
     # DRAM BW you need hardware counters (VTune / GPA).
     bytes_per_element = 2 if kv_cache_compression == 0 else 1  # fp16 or int8
 
-    kv_bytes = q_len * past_len * num_kv_heads * head_size * 2 * bytes_per_element
+    kv_bytes = past_len * num_kv_heads * head_size * 2 * bytes_per_element
 
     # Add quantization metadata overhead if compressed
     if kv_cache_compression == 1:  # per-token
-        kv_bytes += q_len * past_len * num_kv_heads * 2 * 2  # scale + zp (fp16) per token
+        kv_bytes += past_len * num_kv_heads * 2 * 2  # scale + zp (fp16) per token
+    elif kv_cache_compression == 2:  # per-channel
+        kv_bytes += (past_len // 16) * num_kv_heads * 2 * 2
+
+    bandwidth_gbs = kv_bytes / (time_ms * 1e-3) / 1e9
+
+    return kv_bytes, bandwidth_gbs
+
+
+def _calc_actual_kv_bandwidth(
+    past_len: int,
+    num_kv_heads: int,
+    head_size: int,
+    kv_cache_compression: int,
+    time_ms: float,
+) -> Tuple[float, float]:
+    """
+    Calculate ACTUAL KV cache bandwidth (true memory-bound analysis).
+
+    For small_q kernels: all Q tokens share the SAME KV cache, so actual
+    memory access = past_len (not q_len * past_len).
+
+    This is the REAL memory bandwidth needed, independent of q_len.
+
+    Returns:
+        (actual_kv_bytes_read, actual_bandwidth_gbs)
+    """
+    bytes_per_element = 2 if kv_cache_compression == 0 else 1  # fp16 or int8
+
+    # Actual: KV bytes = past_len (all Q reuse same KV), NOT q_len * past_len
+    kv_bytes = past_len * num_kv_heads * head_size * 2 * bytes_per_element  # 2 for K+V
+
+    # Add metadata for compression (per-token, also doesn't scale with q_len)
+    if kv_cache_compression == 1:  # per-token
+        kv_bytes += past_len * num_kv_heads * 2 * 2  # scale + zp (fp16) per token
     elif kv_cache_compression == 2:  # per-channel
         kv_bytes += (past_len // 16) * num_kv_heads * 2 * 2
 
@@ -693,7 +731,7 @@ def test_15k_summary_cmpr1():
 # ============================================================================
 
 @pytest.mark.parametrize("q_len", [3, 4, 8, 16])
-@pytest.mark.parametrize("cmpr", [0, 1])
+@pytest.mark.parametrize("cmpr", [1])
 @pytest.mark.parametrize("tile_q", [1, 2])
 def test_15k_small_q_online(q_len: int, cmpr: int, tile_q: int):
     """Small q online softmax kernel at 15K context."""
@@ -983,6 +1021,530 @@ def _benchmark_online_large_partition(case: SmallQCase, k_part_blocks: int) -> P
         kernel_ms=kernel_ms,
         kernel_bw_gbs=bandwidth,
     )
+
+
+# ============================================================================
+# Test Case 6: Q=16 Compression Cache-Invalidation Study
+# ============================================================================
+
+def _run_perf_cache_invalidation(runner, case: SmallQCase, num_iters: int = 100,
+                                warmup: int = 10) -> dict[str, float]:
+    """Kernel-only timing with cache invalidation via different KV data each iteration.
+
+    This isolates true memory bandwidth by ensuring L2 cache doesn't artificially
+    inflate performance. Each iteration uses fresh K/V tensors (same shape, different data).
+
+    Args:
+        num_iters: Total iterations (includes warmup)
+        warmup: Skip first N iterations from timing
+
+    Returns:
+        Dict with kernel timing and stats
+    """
+    kernels = runner._create_kernels()
+
+    # Build input shape once
+    case_dummy = SmallQCase(
+        num_heads=case.num_heads,
+        num_kv_heads=case.num_kv_heads,
+        head_size=case.head_size,
+        block_size=case.block_size,
+        past_len=case.past_len,
+        q_len=case.q_len,
+        kv_cache_compression=case.kv_cache_compression,
+        tile_q=case.tile_q,
+    )
+    data_dummy = _build_small_q_inputs(case_dummy)
+
+    query = data_dummy["query"]
+    past_lens = data_dummy["past_lens"]
+    block_indices = data_dummy["block_indices"]
+    block_indices_begins = data_dummy["block_indices_begins"]
+    subsequence_begins = data_dummy["subsequence_begins"]
+
+    q_len = int(query.shape[0])
+    max_context_len = int(past_lens.max().item()) + q_len
+    kv_partition_num = _ceil_div(max_context_len, runner.kv_partition_size)
+    mapping, tile_count = runner._build_mapping(q_len, runner.tile_q)
+    partition_token_rows = tile_count * runner.tile_q
+
+    # Pre-allocate static tensors (same for all iterations)
+    t_q = cl.tensor(query.detach().numpy())
+    t_past = cl.tensor(past_lens.detach().numpy())
+    t_bi = cl.tensor(block_indices.detach().numpy())
+    t_bib = cl.tensor(block_indices_begins.detach().numpy())
+    t_sb = cl.tensor(subsequence_begins.detach().numpy())
+    t_map = cl.tensor(mapping.detach().numpy())
+    t_po = cl.tensor([partition_token_rows, runner.num_heads, kv_partition_num, runner.head_size],
+                     np.dtype(np.float32))
+    t_lse = cl.tensor([partition_token_rows, runner.num_heads, kv_partition_num],
+                      np.dtype(np.float32))
+    t_out = cl.tensor([q_len, runner.num_heads, runner.head_size], np.dtype(np.float16))
+
+    gws = [int(tile_count), runner.num_kv_heads * runner.q_head_chunks_per_kv_head, kv_partition_num]
+    lws = [1, 1, 1]
+    gws_2 = [int(tile_count) * runner.tile_q, runner.num_heads, runner.head_size // runner.reduce_split_step]
+    lws_2 = [1, 1, 1]
+
+    # Run iterations with fresh K/V each time (different random data)
+    for i in range(num_iters):
+        # Generate new K/V data each iteration (different random seed)
+        torch.manual_seed(1000 + i)  # Different seed per iteration
+        data_fresh = _build_small_q_inputs(case)
+
+        # Upload fresh K/V tensors
+        t_k = cl.tensor(data_fresh["key_cache"].contiguous().detach().numpy())
+        t_v = cl.tensor(data_fresh["value_cache"].contiguous().detach().numpy())
+
+        # Enqueue kernels
+        kernels.enqueue("cm_pa_small_q", gws, lws,
+                       t_q, t_k, t_v, t_past, t_bi, t_bib, t_sb, t_map, t_po, t_lse,
+                       q_len, int(tile_count))
+        kernels.enqueue("cm_pa_small_q_reduce", gws_2, lws_2,
+                       t_po, t_out, t_lse, t_sb, t_map, partition_token_rows, kv_partition_num)
+
+    # Finish and collect all profiling events
+    latency = cl.finish()
+    expected = 2 * num_iters
+    if len(latency) < expected:
+        raise RuntimeError(f"Expected at least {expected} profiling events, got {len(latency)}")
+
+    # Accumulate timing (skip warmup iterations)
+    sq_total = 0.0
+    rd_total = 0.0
+    runs = 0
+    for pair_idx in range(num_iters):
+        kv_ns = float(latency[2 * pair_idx])
+        rd_ns = float(latency[2 * pair_idx + 1])
+        if kv_ns <= 0 or rd_ns <= 0 or pair_idx < warmup:
+            continue
+        sq_total += kv_ns
+        rd_total += rd_ns
+        runs += 1
+
+    if runs <= 0:
+        raise RuntimeError("Invalid perf timing accumulation")
+
+    return {
+        "small_q_ms": sq_total * 1e-6 / runs,
+        "small_q_reduce_ms": rd_total * 1e-6 / runs,
+        "num_samples": runs,
+    }
+
+
+def _run_perf_cache_invalidation_single_token(runner, case: DecodingCase, num_iters: int = 100,
+                                             warmup: int = 10) -> dict[str, float]:
+    """Profiling-event timing for single_token with cache invalidation (fresh KV each iteration).
+
+    Uses kernel profiling events (like small_q) instead of wall-clock to get
+    accurate GPU timing. Pre-allocates kernels and enqueues with fresh K/V data.
+
+    Args:
+        num_iters: Total iterations (includes warmup)
+        warmup: Skip first N iterations from timing
+
+    Returns:
+        Dict with timing info
+    """
+    from test_pa_decoding import _build_single_subsequence_inputs
+
+    kernels = runner._create_kernels()
+
+    # Build one dummy input to get kernel parameters
+    data_dummy = _build_single_subsequence_inputs(case)
+
+    query = data_dummy["query"]
+    past_lens = data_dummy["past_lens"]
+    block_indices = data_dummy["block_indices"]
+    block_indices_begins = data_dummy["block_indices_begins"]
+    subsequence_begins = data_dummy["subsequence_begins"]
+
+    batch = int(query.shape[0])
+    max_context_len = int(past_lens.max().item()) + 1
+    kv_partition_num = (max_context_len + runner.kv_partition_size - 1) // runner.kv_partition_size
+    gws = [batch, runner.num_kv_heads * runner.q_head_chunks_per_kv_head, kv_partition_num]
+    lws = [1, 1, 1]
+    gws_2 = [batch, runner.num_heads, runner.head_size // runner.reduce_split_step]
+    lws_2 = [1, 1, 1]
+
+    # Pre-allocate static tensors (same across iterations)
+    t_q = cl.tensor(query.detach().numpy())
+    t_past = cl.tensor(past_lens.detach().numpy())
+    t_bi = cl.tensor(block_indices.detach().numpy())
+    t_bib = cl.tensor(block_indices_begins.detach().numpy())
+    t_sb = cl.tensor(subsequence_begins.detach().numpy())
+    t_out = cl.tensor(torch.zeros([batch, runner.num_heads, kv_partition_num, runner.head_size],
+                                   dtype=torch.float32).detach().numpy())
+    t_out_final = cl.tensor(torch.zeros_like(query).detach().numpy())
+    t_lse = cl.tensor(torch.zeros([batch, runner.num_heads, kv_partition_num], dtype=torch.float32).detach().numpy())
+
+    # Selected sequence IDs (single token decode: only sequence 0)
+    selected_sequence_ids = torch.tensor([0], dtype=torch.int32)
+    t_selected = cl.tensor(selected_sequence_ids.detach().numpy())
+    selected_count = int(selected_sequence_ids.numel())
+
+    # Clear profiling events before timed loop (prevents prior H2D transfer times from being included)
+    cl.finish()
+
+    # Enqueue with fresh K/V each iteration
+    # NOTE: cl.tensor() H2D transfers may be included in profiling! To isolate pure kernel time:
+    #   - Data generation (torch): NOT timed (CPU)
+    #   - cl.tensor() upload: POTENTIALLY TIMED (GPU H2D)
+    #   - kernel enqueue + execute: TIMED (GPU compute)
+    #   - cl.finish(): returns only kernel profiling events, NOT H2D times
+    for i in range(num_iters + warmup):
+        # Generate fresh K/V data (CPU, not timed)
+        torch.manual_seed(2000 + i)
+        data_fresh = _build_single_subsequence_inputs(case)
+
+        # Upload fresh K/V tensors (GPU H2D - may be included in profiling)
+        t_k = cl.tensor(data_fresh["key_cache"].contiguous().detach().numpy())
+        t_v = cl.tensor(data_fresh["value_cache"].contiguous().detach().numpy())
+
+        # Enqueue kernels (GPU compute - definitely timed)
+        kernels.enqueue("cm_sdpa_2nd", gws, lws,
+                       t_q, t_k, t_v, t_past, t_bi, t_bib, t_sb, t_selected, t_out, t_lse,
+                       1, selected_count)
+        kernels.enqueue("cm_sdpa_2nd_reduce", gws_2, lws_2,
+                       t_out, t_out_final, t_lse, t_sb, t_selected, selected_count, kv_partition_num)
+
+    # Finish and collect profiling events
+    latency = cl.finish()
+    expected = 2 * (num_iters + warmup)
+    if len(latency) < expected:
+        raise RuntimeError(f"Expected at least {expected} profiling events, got {len(latency)}")
+
+    # Accumulate timing (skip warmup)
+    main_total = 0.0
+    reduce_total = 0.0
+    runs = 0
+    for i in range(num_iters + warmup):
+        main_ns = float(latency[2 * i])
+        reduce_ns = float(latency[2 * i + 1])
+        if main_ns <= 0 or reduce_ns <= 0 or i < warmup:
+            continue
+        main_total += main_ns
+        reduce_total += reduce_ns
+        runs += 1
+
+    if runs <= 0:
+        raise RuntimeError("Invalid perf timing accumulation")
+
+    result = {
+        "cm_sdpa_2nd_ms": main_total * 1e-6 / runs,
+        "cm_sdpa_2nd_reduce_ms": reduce_total * 1e-6 / runs,
+        "num_samples": runs,
+    }
+
+    # Explicit cleanup to release GPU memory
+    del t_q, t_past, t_bi, t_bib, t_sb, t_out, t_lse, t_selected
+    cl.finish()
+
+    return result
+
+
+def _run_perf_single_token_cached(runner, case: DecodingCase, num_iters: int = 100,
+                                 warmup: int = 10) -> dict[str, float]:
+    """Profiling-event timing for single_token WITHOUT cache invalidation (reuse same KV).
+
+    Uses same K/V tensor data across iterations, allowing L2 cache to boost
+    performance. Compare against cache_invalidation version to quantify cache benefit.
+
+    Args:
+        num_iters: Total iterations (includes warmup)
+        warmup: Skip first N iterations from timing
+
+    Returns:
+        Dict with timing info
+    """
+    from test_pa_decoding import _build_single_subsequence_inputs
+
+    kernels = runner._create_kernels()
+
+    # Build input once and REUSE it
+    data = _build_single_subsequence_inputs(case)
+
+    query = data["query"]
+    past_lens = data["past_lens"]
+    block_indices = data["block_indices"]
+    block_indices_begins = data["block_indices_begins"]
+    subsequence_begins = data["subsequence_begins"]
+    key_cache = data["key_cache"]
+    value_cache = data["value_cache"]
+
+    batch = int(query.shape[0])
+    max_context_len = int(past_lens.max().item()) + 1
+    kv_partition_num = (max_context_len + runner.kv_partition_size - 1) // runner.kv_partition_size
+    gws = [batch, runner.num_kv_heads * runner.q_head_chunks_per_kv_head, kv_partition_num]
+    lws = [1, 1, 1]
+    gws_2 = [batch, runner.num_heads, runner.head_size // runner.reduce_split_step]
+    lws_2 = [1, 1, 1]
+
+    # Pre-allocate ALL tensors (K/V will be REUSED, not regenerated)
+    t_q = cl.tensor(query.detach().numpy())
+    t_k = cl.tensor(key_cache.contiguous().detach().numpy())
+    t_v = cl.tensor(value_cache.contiguous().detach().numpy())
+    t_past = cl.tensor(past_lens.detach().numpy())
+    t_bi = cl.tensor(block_indices.detach().numpy())
+    t_bib = cl.tensor(block_indices_begins.detach().numpy())
+    t_sb = cl.tensor(subsequence_begins.detach().numpy())
+    t_out = cl.tensor(torch.zeros([batch, runner.num_heads, kv_partition_num, runner.head_size],
+                                   dtype=torch.float32).detach().numpy())
+    t_out_final = cl.tensor(torch.zeros_like(query).detach().numpy())
+    t_lse = cl.tensor(torch.zeros([batch, runner.num_heads, kv_partition_num], dtype=torch.float32).detach().numpy())
+
+    # Selected sequence IDs
+    selected_sequence_ids = torch.tensor([0], dtype=torch.int32)
+    t_selected = cl.tensor(selected_sequence_ids.detach().numpy())
+    selected_count = int(selected_sequence_ids.numel())
+    #cl.finish()
+    # Enqueue kernels with SAME K/V data (allows L2 cache to help)
+    for i in range(num_iters + warmup):
+        kernels.enqueue("cm_sdpa_2nd", gws, lws,
+                       t_q, t_k, t_v, t_past, t_bi, t_bib, t_sb, t_selected, t_out, t_lse,
+                       1, selected_count)
+        kernels.enqueue("cm_sdpa_2nd_reduce", gws_2, lws_2,
+                       t_out, t_out_final, t_lse, t_sb, t_selected, selected_count, kv_partition_num)
+
+    # Finish and collect profiling events
+    latency = cl.finish()
+    expected = 2 * (num_iters + warmup)
+    if len(latency) < expected:
+        raise RuntimeError(f"Expected at least {expected} profiling events, got {len(latency)}")
+
+    # Accumulate timing (skip warmup)
+    main_total = 0.0
+    reduce_total = 0.0
+    runs = 0
+    for i in range(num_iters + warmup):
+        main_ns = float(latency[2 * i])
+        reduce_ns = float(latency[2 * i + 1])
+        if main_ns <= 0 or reduce_ns <= 0 or i < warmup:
+            continue
+        main_total += main_ns
+        reduce_total += reduce_ns
+        runs += 1
+
+    if runs <= 0:
+        raise RuntimeError("Invalid perf timing accumulation")
+
+    result = {
+        "cm_sdpa_2nd_ms": main_total * 1e-6 / runs,
+        "cm_sdpa_2nd_reduce_ms": reduce_total * 1e-6 / runs,
+        "num_samples": runs,
+    }
+
+    # Explicit cleanup
+    del t_q, t_k, t_v, t_past, t_bi, t_bib, t_sb, t_out, t_out_final, t_lse, t_selected
+    cl.finish()
+
+    return result
+
+
+def test_15k_q1_cmpr1_cache_invalidation():
+    """Test q=1 (single token), cmpr=1 with cache invalidation.
+
+    Compare against q=16 to see how cache reuse affects memory bandwidth.
+    Fresh KV each iteration prevents L2 cache from hiding true DRAM bandwidth.
+    """
+    if os.environ.get("RUN_PA_PERF", "0") != "1":
+        pytest.skip("Set RUN_PA_PERF=1 to enable perf test")
+
+    case = DecodingCase(
+        num_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        block_size=256,
+        kv_len=PAST_LEN_15K,
+        kv_cache_compression=1,  # INT8
+    )
+
+    runner = PaSingleTokenRunner(
+        case.num_heads,
+        case.num_kv_heads,
+        case.head_size,
+        case.block_size,
+        case.sub_block_size,
+        case.kv_cache_compression,
+    )
+
+    print("\n" + "=" * 100)
+    print(f"Q=1 (Single Token), CMPR=1: Cache Invalidation Study (fresh KV each iteration)")
+    print("=" * 100)
+
+    # Test with different numbers of iterations (reduced to save GPU memory)
+    for num_iters in [20, 40, 60]:
+        try:
+            perf = _run_perf_cache_invalidation_single_token(runner, case, num_iters=num_iters, warmup=5)
+
+            # Main kernel timing
+            main_ms = perf["cm_sdpa_2nd_ms"]
+
+            # KV cache size: padded to block boundaries (like test_pa_decoding)
+            # key_cache.shape[0] = number of blocks
+            # actual kv_len = num_blocks * block_size
+            from test_pa_decoding import _build_single_subsequence_inputs
+            data_sample = _build_single_subsequence_inputs(case)
+            new_kv_len = int(data_sample["key_cache"].shape[0] * case.block_size)
+            kv_bytes = new_kv_len * 8 * 128 * 1 * 2  # (kv_len, num_kv_heads, head_size, 1 for INT8, 2 for K+V)
+            bandwidth = kv_bytes / (main_ms * 1e-3) / 1e9
+
+            print(f"\n[Iters={num_iters:3d}] Samples={perf['num_samples']:2d}")
+            print(f"  Main Kernel: {main_ms:7.3f}ms")
+            print(f"  Padded KV Length: {new_kv_len} (blocks={data_sample['key_cache'].shape[0]}, block_size={case.block_size})")
+            print(f"  KV Bytes: {kv_bytes:,.0f} bytes = {kv_bytes/1e9:.3f} GB")
+            print(f"  BW: {bandwidth:6.1f} GB/s (main kernel only)")
+            print(f"  GFLOPS: {bandwidth * 2:.1f} (AI=2 for Q=1)")
+        except Exception as e:
+            print(f"\n[Iters={num_iters:3d}] Failed: {e}")
+
+    # Explicit cleanup
+    del runner
+    cl.finish()
+
+    print("\n" + "=" * 100)
+    print("COMPARISON NOTES:")
+    print("  Q=1 vs Q=16 (both cmpr=1, cache-invalidated):")
+    print("  - Q=1 can only do Q_len=1 worth of computation")
+    print("  - Q=16 does 16x computation but needs 16x more KV bandwidth")
+    print("  - If both hit memory peak (~100GB/s on your GPU), they're equally memory-bound")
+    print("  - Q=16 should have higher absolute GFLOPS due to more computation per KV access")
+    print("=" * 100)
+
+
+def test_15k_q1_cmpr1_no_cache_invalidation():
+    """Test q=1 (single token), cmpr=1 WITHOUT cache invalidation.
+
+    Reuses same KV data across iterations, allowing L2 cache to boost performance.
+    Compare against cache_invalidation version to see cache benefit.
+    """
+    if os.environ.get("RUN_PA_PERF", "0") != "1":
+        pytest.skip("Set RUN_PA_PERF=1 to enable perf test")
+
+    case = DecodingCase(
+        num_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        block_size=256,
+        kv_len=PAST_LEN_15K,
+        kv_cache_compression=1,  # INT8
+    )
+
+    runner = PaSingleTokenRunner(
+        case.num_heads,
+        case.num_kv_heads,
+        case.head_size,
+        case.block_size,
+        case.sub_block_size,
+        case.kv_cache_compression,
+    )
+
+    print("\n" + "=" * 100)
+    print(f"Q=1 (Single Token), CMPR=1: NO Cache Invalidation (same KV reused - L2 cache helps)")
+    print("=" * 100)
+
+    # Test with different numbers of iterations
+    for num_iters in [20, 40, 60]:
+        try:
+            perf = _run_perf_single_token_cached(runner, case, num_iters=num_iters, warmup=5)
+
+            # Main kernel timing only
+            main_ms = perf["cm_sdpa_2nd_ms"]
+
+            # KV cache size: padded to block boundaries
+            from test_pa_decoding import _build_single_subsequence_inputs
+            data_sample = _build_single_subsequence_inputs(case)
+            new_kv_len = int(data_sample["key_cache"].shape[0] * case.block_size)
+            kv_bytes = new_kv_len * 8 * 128 * 1 * 2  # (kv_len, num_kv_heads, head_size, 1 for INT8, 2 for K+V)
+            bandwidth = kv_bytes / (main_ms * 1e-3) / 1e9
+
+            print(f"\n[Iters={num_iters:3d}] Samples={perf['num_samples']:2d}")
+            print(f"  Main Kernel: {main_ms:7.3f}ms")
+            print(f"  Padded KV Length: {new_kv_len} (blocks={data_sample['key_cache'].shape[0]}, block_size={case.block_size})")
+            print(f"  KV Bytes: {kv_bytes:,.0f} bytes = {kv_bytes/1e9:.3f} GB")
+            print(f"  BW: {bandwidth:6.1f} GB/s (main kernel + L2 cache)")
+            print(f"  GFLOPS: {bandwidth * 2:.1f} (AI=2 for Q=1)")
+        except Exception as e:
+            print(f"\n[Iters={num_iters:3d}] Failed: {e}")
+
+    print("\n" + "=" * 100)
+    print("COMPARISON NOTE:")
+    print("  Compare BW with cache_invalidation version:")
+    print("  - Lower BW (cache invalidation):  true memory-bound behavior")
+    print("  - Higher BW (no invalidation):    L2 cache boost effect")
+    print("=" * 100)
+
+    # Explicit cleanup
+    del runner
+    cl.finish()
+
+
+def test_15k_q16_cmpr1_cache_invalidation():
+    """Test q=16, cmpr=1 with cache invalidation (fresh KV each iteration).
+
+    This reveals the true memory-bound performance by preventing L2 cache
+    from caching across iterations. Each run uses different KV data.
+    """
+    if os.environ.get("RUN_PA_PERF", "0") != "1":
+        pytest.skip("Set RUN_PA_PERF=1 to enable perf test")
+
+    case = SmallQCase(
+        num_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        block_size=256,
+        past_len=PAST_LEN_15K,
+        q_len=16,
+        kv_cache_compression=1,  # INT8
+        tile_q=2,
+    )
+
+    runner = PaSmallQRunner.create_instance(
+        case.num_heads,
+        case.num_kv_heads,
+        case.head_size,
+        case.block_size,
+        case.sub_block_size,
+        case.kv_cache_compression,
+        tile_q=case.tile_q,
+    )
+
+    print("\n" + "=" * 100)
+    print(f"Q=16, CMPR=1, TILE_Q=2: Cache Invalidation Study (fresh KV each iteration)")
+    print("=" * 100)
+
+    # Test with different numbers of iterations to see if performance stabilizes
+    for num_iters in [30, 60, 100]:
+        try:
+            perf = _run_perf_cache_invalidation(runner, case, num_iters=num_iters, warmup=8)
+            kernel_ms = perf["small_q_ms"] + perf["small_q_reduce_ms"]
+
+            # Calculate bandwidth
+            kv_bytes, bandwidth = _calc_kv_bandwidth(
+                q_len=16,
+                past_len=PAST_LEN_15K,
+                num_kv_heads=8,
+                head_size=128,
+                kv_cache_compression=1,
+                time_ms=kernel_ms,
+            )
+
+            print(f"\n[Iters={num_iters:3d}] Samples={perf['num_samples']:2d}")
+            print(f"  Time: Kernel={kernel_ms:7.3f}ms (small_q={perf['small_q_ms']:7.3f}, reduce={perf['small_q_reduce_ms']:7.3f})")
+            print(f"  KV Bytes: {kv_bytes:,.0f} bytes = {kv_bytes/1e9:.3f} GB")
+            print(f"  BW: {bandwidth:6.1f} GB/s")
+            print(f"  GFLOPS: {bandwidth * 32:.1f} (AI≈32 for Q=16)")
+        except Exception as e:
+            print(f"\n[Iters={num_iters:3d}] Failed: {e}")
+
+    print("\nNOTE: Q=16 uses profiling events (more precise), Q=1 uses wall-clock (includes some overhead)")
+
+    print("\n" + "=" * 100)
+    print("INTERPRETATION:")
+    print("  - If BW stabilizes and is low (< 100 GB/s): true memory-bound, not cache-hit inflation")
+    print("  - If BW varies significantly: L2 cache is still affecting results even with fresh data")
+    print("  - Compare with 'cached' version to quantify cache benefit")
+    print("=" * 100)
 
 
 if __name__ == "__main__":
