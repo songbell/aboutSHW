@@ -96,6 +96,7 @@ class SmallQCase:
     q_len: int = 16             # number of new query tokens (spec window)
     kv_cache_compression: int = 0
     tile_q: int = DEFAULT_TILE_Q
+    partition_block_num: int = 8   # number of blocks per partition (for KV partitioning)
 
 
 class PaSmallQRunner:
@@ -112,6 +113,7 @@ class PaSmallQRunner:
         sub_block_size: int,
         kv_cache_compression: int,
         tile_q: int = DEFAULT_TILE_Q,
+        k_partition_block_num: int = 8,
     ):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -131,9 +133,10 @@ class PaSmallQRunner:
         self.xe_arch = 1 if self.cm_grf_width == 256 else 2
         self.kv_step = 8 if self.xe_arch == 1 else 16
 
-        self.k_partition_block_num = 1
+        self.k_partition_block_num = k_partition_block_num
         self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
-        self.reduce_split_step = 8
+        print(f"PaSmallQRunner: kv_partition_size={self.kv_partition_size} (block_size={self.block_size} * k_partition_block_num={self.k_partition_block_num})")
+        self.reduce_split_step = 64
 
         # Mirror OV's get_single_token_q_chunking with tile_q_factor = TILE_Q so
         # the chunking solver shrinks q_head_chunk_size when the rS / Pmat /
@@ -180,6 +183,7 @@ class PaSmallQRunner:
         sub_block_size: int,
         kv_cache_compression: int,
         tile_q: int = DEFAULT_TILE_Q,
+        k_partition_block_num: int = 8,
     ):
         return PaSmallQRunner(
             num_heads,
@@ -189,6 +193,7 @@ class PaSmallQRunner:
             sub_block_size,
             kv_cache_compression,
             tile_q=tile_q,
+            k_partition_block_num=k_partition_block_num,
         )
 
     @staticmethod
