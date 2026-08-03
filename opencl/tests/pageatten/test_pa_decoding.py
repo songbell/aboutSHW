@@ -84,7 +84,7 @@ class PaSingleTokenRunner:
         self.xe_arch = 1 if self.cm_grf_width == 256 else 2
         self.kv_step = 8 if self.xe_arch == 1 else 16
 
-        self.k_partition_block_num = 1
+        self.k_partition_block_num = 8
         self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
         self.reduce_split_step = 8
 
@@ -569,9 +569,9 @@ def test_pa_perf_bandwidth_generate_single_subsequence_default_params():
         num_heads=32,
         num_kv_heads=8,
         head_size=128,
-        block_size=256,
-        kv_len=32769,
-        kv_cache_compression=0,
+        block_size=16,
+        kv_len=15360,
+        kv_cache_compression=1,
     )
     perf = _run_bandwidth_measurement(case, loop_cnt=100, warmup=5)
 

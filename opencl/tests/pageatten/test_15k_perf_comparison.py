@@ -47,7 +47,7 @@ class PaSmallQOnlineRunner(PaSmallQRunner):
     """Runner that uses pa_small_q_ov.cm with configurable partition size."""
 
     def __init__(self, *args, k_partition_block_num=1, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, k_partition_block_num=k_partition_block_num, **kwargs)
         self.k_partition_block_num = k_partition_block_num
         self.kv_partition_size = self.block_size * k_partition_block_num
 
@@ -730,9 +730,9 @@ def test_15k_summary_cmpr1():
 # Test Case 4: Small Q Online Softmax (q=3-16)
 # ============================================================================
 
-@pytest.mark.parametrize("q_len", [3, 4, 8, 16])
+@pytest.mark.parametrize("q_len", [6])
 @pytest.mark.parametrize("cmpr", [1])
-@pytest.mark.parametrize("tile_q", [1, 2])
+@pytest.mark.parametrize("tile_q", [1, 2, 6])
 def test_15k_small_q_online(q_len: int, cmpr: int, tile_q: int):
     """Small q online softmax kernel at 15K context."""
     if os.environ.get("RUN_PA_PERF", "0") != "1":
@@ -750,11 +750,37 @@ def test_15k_small_q_online(q_len: int, cmpr: int, tile_q: int):
         q_len=q_len,
         kv_cache_compression=cmpr,
         tile_q=tile_q,
+        partition_block_num = 1
     )
 
     result = _benchmark_small_q_online(case)
     print(f"\n{result}")
 
+@pytest.mark.parametrize("q_len", [6, 16])
+@pytest.mark.parametrize("cmpr", [1])
+@pytest.mark.parametrize("tile_q", [1, 2, 6, 8, 16])
+def test_15k_small_q_online_block_size_16(q_len: int, cmpr: int, tile_q: int):
+    """Small q online softmax kernel at 15K context."""
+    if os.environ.get("RUN_PA_PERF", "0") != "1":
+        pytest.skip("Set RUN_PA_PERF=1 to enable perf test")
+
+    if tile_q > q_len:
+        pytest.skip(f"tile_q={tile_q} exceeds q_len={q_len}")
+
+    case = SmallQCase(
+        num_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        block_size=16,
+        past_len=PAST_LEN_15K,
+        q_len=q_len,
+        kv_cache_compression=cmpr,
+        tile_q=tile_q,
+        partition_block_num=8  # kv_partition_size = 16 * 8 = 128
+    )
+
+    result = _benchmark_small_q_online(case)
+    print(f"\n{result}")
 
 def _run_perf_with_runner(runner, case: SmallQCase, loop_cnt: int = 60,
                           warmup: int = 8) -> dict[str, float]:
@@ -861,6 +887,7 @@ def _benchmark_small_q_online(case: SmallQCase) -> PerfResult:
         case.sub_block_size,
         case.kv_cache_compression,
         tile_q=case.tile_q,
+        k_partition_block_num=case.partition_block_num
     )
 
     data = _build_small_q_inputs(case)
@@ -886,6 +913,7 @@ def _benchmark_small_q_online(case: SmallQCase) -> PerfResult:
     kernel_ms = 0.0
     try:
         perf = _run_perf_with_runner(runner, case, loop_cnt=60, warmup=8)
+        print(f"  [info] small_q_online kernel-only timing: {perf['small_q_ms']:.3f}ms + {perf['small_q_reduce_ms']:.3f}ms")
         kernel_ms = perf["small_q_ms"] + perf["small_q_reduce_ms"]
     except Exception as e:
         print(f"  [warn] small_q_online kernel-only timing failed q={case.q_len} tile={case.tile_q}: {e}")
