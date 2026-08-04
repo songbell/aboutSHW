@@ -282,6 +282,26 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     #pragma unroll
     for (int online_tile = 0; online_tile < NUM_ONLINE_TILES; online_tile++) {
         const int tile_kv_start = online_tile * ONLINE_TILE_SIZE;
+        const uint tile_block_start = tile_kv_start / KV_BLOCK_SIZE;
+        const uint tile_block_end = (tile_kv_start + ONLINE_TILE_SIZE + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+        const uint tile_block_limit = tile_block_end < (uint)block_num ? tile_block_end : (uint)block_num;
+        if (tile_block_start >= tile_block_limit)
+            continue;
+
+        // Cache block indices once per tile and reuse for both K-phase and V-phase.
+        // For block_size=16 this path is hot (many tiny blocks), so cutting duplicated
+        // index reads helps reduce send/wait pressure (SBID/idle).
+        vector<uint, 8> block_indices_cache = 0;
+        const uint actual_tile_block_count = tile_block_limit - tile_block_start;
+        const uint cache_count = actual_tile_block_count < 8u ? actual_tile_block_count : 8u;
+        if (cache_count == 8u) {
+            cm_svm_block_read<uint, 8>((svmptr_t)(block_indices + start_block_idx + tile_block_start), block_indices_cache);
+        } else {
+            #pragma unroll
+            for (uint i = 0; i < cache_count; i++) {
+                block_indices_cache[i] = block_indices[start_block_idx + tile_block_start + i];
+            }
+        }
 
         // =====================================================================
         // Phase 1: Q @ K for this online tile
@@ -289,11 +309,9 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         matrix<float, Q_ROWS, ONLINE_TILE_STEPS * REG_N> rS_tile = 0;
 
         {
-        const uint tile_block_start = tile_kv_start / KV_BLOCK_SIZE;
-        const uint tile_block_end = (tile_kv_start + ONLINE_TILE_SIZE + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
         #pragma unroll
-        for (uint block_idx = tile_block_start; block_idx < block_num && block_idx < tile_block_end; block_idx++) {
-            uint blk_indices = block_indices[start_block_idx + block_idx];
+        for (uint block_idx = tile_block_start; block_idx < tile_block_limit; block_idx++) {
+            uint blk_indices = block_indices_cache[block_idx - tile_block_start];
             uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
             uint k_scale_zp_offset = k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
 
@@ -645,11 +663,9 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         // Phase 4: P_tile @ V for this online tile
         // =====================================================================
         {
-        const uint tile_block_start_v = tile_kv_start / KV_BLOCK_SIZE;
-        const uint tile_block_end_v = (tile_kv_start + ONLINE_TILE_SIZE + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
         #pragma unroll
-        for (uint block_idx = tile_block_start_v; block_idx < block_num && block_idx < tile_block_end_v; block_idx++) {
-            uint blk_indices = block_indices[start_block_idx + block_idx];
+        for (uint block_idx = tile_block_start; block_idx < tile_block_limit; block_idx++) {
+            uint blk_indices = block_indices_cache[block_idx - tile_block_start];
             uint v_base_offset = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
             uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
 
