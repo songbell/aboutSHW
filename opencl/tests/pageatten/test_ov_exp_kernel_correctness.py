@@ -69,14 +69,14 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
             and (self.q_head_chunk_size * self.tile_q) > 8
         ):
             self.workgroup_q_groups = (self.q_head_chunk_size * self.tile_q) // 8
-
+        #print(f"PaSmallQOvExpRunner: q_head_chunk_size={self.q_head_chunk_size}, q_head_chunks_per_kv_head={self.q_head_chunks_per_kv_head}, workgroup_q_groups={self.workgroup_q_groups}")
     @staticmethod
     @functools.lru_cache(maxsize=8)
     def _create_kernels_ov_exp(
         num_heads, num_kv_heads, head_size, kv_step, block_size, sub_block_size,
         kv_partition_size, reduce_split_step, clean_unused_kvcache,
         kv_cache_compression, xe_arch, q_head_chunks_per_kv_head,
-        q_head_chunk_size, tile_q, scale_factor,
+        q_head_chunk_size, tile_q, scale_factor, source_stamp,
     ):
         src = '\n'.join([
             '#include "pa_small_q_ov_exp.cm"',
@@ -100,10 +100,13 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
                         -DQ_head_chunk_size={q_head_chunk_size}
                         -DTILE_Q={tile_q}
                         -DSCALE_FACTOR={scale_factor}
+                        -DOV_EXP_SOURCE_STAMP={source_stamp}
                         -DKERNEL_NAME=cm_pa_small_q''',
         )
 
     def _create_kernels(self):
+        source_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_small_q_ov_exp.cm")
+        source_stamp = int(os.stat(source_path).st_mtime_ns)
         return self._create_kernels_ov_exp(
             self.num_heads,
             self.num_kv_heads,
@@ -120,11 +123,13 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
             int(self.q_head_chunk_size),
             self.tile_q,
             self.scale_factor,
+            source_stamp,
         )
 
     def dispatch_dims(self, tile_count: int, kv_partition_num: int):
         gws = [int(tile_count) * self.workgroup_q_groups, self.num_kv_heads * self.q_head_chunks_per_kv_head, kv_partition_num]
         lws = [self.workgroup_q_groups, 1, 1]
+        #print(f"PaSmallQOvExpRunner.dispatch_dims: gws={gws}, lws={lws}, tile_count={tile_count}, kv_partition_num={kv_partition_num}")
         partition_token_rows = int(tile_count) * self.tile_q
         gws_2 = [partition_token_rows, self.num_heads, self.head_size // self.reduce_split_step]
         lws_2 = [1, 1, 1]
@@ -158,11 +163,18 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
         t_mapping = cl.tensor(mapping.detach().numpy())
 
         t_partition_out = cl.tensor(
-            [partition_token_rows, self.num_heads, padded_partition_num, self.head_size],
-            np.dtype(np.float32),
+            np.full(
+                [partition_token_rows, self.num_heads, padded_partition_num, self.head_size],
+                np.nan,
+                dtype=np.float32,
+            )
         )
         t_lse = cl.tensor(
-            [partition_token_rows, self.num_heads, padded_partition_num], np.dtype(np.float32)
+            np.full(
+                [partition_token_rows, self.num_heads, padded_partition_num],
+                np.nan,
+                dtype=np.float32,
+            )
         )
         t_out_final = cl.tensor(out.contiguous().detach().numpy())
 
@@ -216,9 +228,15 @@ def _run_ov_exp(case: SmallQCase, data: dict) -> torch.Tensor:
     return out
 
 
-def _case_exp(q_len: int, past_len: int, cmpr: int, tile_q: int) -> tuple[bool, float]:
+def _case_exp(
+    q_len: int,
+    past_len: int,
+    cmpr: int,
+    tile_q: int,
+    block_size: int = 256,
+) -> tuple[bool, float]:
     case = SmallQCase(
-        num_heads=32, num_kv_heads=8, head_size=128, block_size=256,
+        num_heads=32, num_kv_heads=8, head_size=128, block_size=block_size,
         past_len=past_len, q_len=q_len, kv_cache_compression=cmpr, tile_q=tile_q,
     )
     data = _build_small_q_inputs(case)
@@ -227,6 +245,7 @@ def _case_exp(q_len: int, past_len: int, cmpr: int, tile_q: int) -> tuple[bool, 
 
     diff = (out_exp.float() - out_base.float()).abs()
     max_diff = diff.max().item()
+    print(f"  Experimental kernel max_diff={max_diff:.4e}")
     passed = max_diff < 0.05 and not torch.isnan(out_exp).any().item()
     return passed, max_diff
 
@@ -236,6 +255,38 @@ def _case_exp(q_len: int, past_len: int, cmpr: int, tile_q: int) -> tuple[bool, 
 def test_ov_exp_smoke(cmpr: int, tile_q: int):
     passed, max_diff = _case_exp(q_len=16, past_len=15360, cmpr=cmpr, tile_q=tile_q)
     assert passed, f"experimental kernel mismatch: max_diff={max_diff:.4e}"
+
+
+@pytest.mark.parametrize(
+    "q_len,past_len,cmpr,tile_q",
+    [
+        (6, 15360, 1, 6),
+        #(6, 15360, 0, 6),
+        #(16, 15360, 1, 2),
+    ],
+)
+def test_ov_exp_correctness_block16_partition128(
+    q_len: int,
+    past_len: int,
+    cmpr: int,
+    tile_q: int,
+    monkeypatch,
+):
+    # Keep this test self-contained so it can be executed directly from pytest.
+    monkeypatch.setenv("OV_EXP_USE_WG_SHARED_KV", "1")
+    monkeypatch.setenv("OV_FORCE_Q_HEAD_CHUNK_SIZE", "4")
+
+    passed, max_diff = _case_exp(
+        q_len=q_len,
+        past_len=past_len,
+        cmpr=cmpr,
+        tile_q=tile_q,
+        block_size=16,
+    )
+    assert passed, (
+        "experimental kernel mismatch under block_size=16, partition_size=128: "
+        f"q_len={q_len} past_len={past_len} cmpr={cmpr} tile_q={tile_q} max_diff={max_diff:.4e}"
+    )
 
 
 if __name__ == "__main__":
