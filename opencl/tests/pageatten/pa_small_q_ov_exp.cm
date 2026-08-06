@@ -177,9 +177,9 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             return;
         }
 
-        constexpr uint K_CHUNK_BYTES = REG_N * HEAD_SIZE * sizeof(uint8_t);
+        constexpr uint K_CHUNK_BYTES = ONLINE_TILE_STEPS * REG_N * HEAD_SIZE * sizeof(uint8_t);
         constexpr uint V_CHUNK_BYTES = REG_K * HEAD_SIZE * sizeof(uint8_t);
-        constexpr uint K_SCALE_BYTES = REG_N * sizeof(half);
+        constexpr uint K_SCALE_BYTES = ONLINE_TILE_STEPS * REG_N * sizeof(half);
         constexpr uint V_SCALE_BYTES = REG_K * sizeof(half);
         cm_slm_init(K_CHUNK_BYTES + V_CHUNK_BYTES + 2 * K_SCALE_BYTES + 2 * V_SCALE_BYTES);
         auto slm_K = cm_slm_alloc(K_CHUNK_BYTES);
@@ -310,6 +310,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             for (int online_tile = 0; online_tile < NUM_ONLINE_TILES; online_tile++) {
                 const int ki_base = online_tile * ONLINE_TILE_STEPS;
                 matrix<float, Q_ROWS_PER_DPAS, ONLINE_TILE_STEPS * REG_N> rS_tile = 0;
+                matrix<half, Q_ROWS_PER_DPAS, ONLINE_TILE_STEPS * REG_N> P_tile = 0;
 
                 if (local_qg == 0) {
                     #pragma unroll
@@ -341,7 +342,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         cm_slm_block_write(slm_K_zp, li * REG_N * sizeof(half), k_zp_local.format<half>());
                     }
                 }
-
                 // Cooperative K staging for current online tile only.
                 #pragma unroll
                 for (int flat_row = local_qg; flat_row < ONLINE_TILE_STEPS * REG_N; flat_row += Q_ROW_GROUPS) {
@@ -365,7 +365,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     cm_slm_block_write(slm_K, (li * REG_N + col) * HEAD_SIZE * sizeof(uint8_t), k_row.format<uint8_t>());
                 }
                 cm_slm_fence(CM_LOCAL_BARRIER);
-
+                cm_barrier();
                 #pragma unroll
                 for (int li = 0; li < ONLINE_TILE_STEPS; li++) {
                     const int ki = ki_base + li;
@@ -385,13 +385,23 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             cm_slm_block_read(slm_K, GENX_DWALIGNED, k_chunk_offset, Krows_quant_chunk.row(col).format<uint8_t>());
                         }
                         matrix<half, REG_K, REG_N> Kt = 0;
+                        matrix<half, REG_N, REG_K> KtNormal = 0;
                         #pragma unroll
                         for (int col = 0; col < REG_N; col++) {
-                            const int kv_row = col;
-                            Kt.column(col) = Krows_quant_chunk.row(col);
-                            Kt.column(col) = Kt.column(col) - slm_k_zp[kv_row];
-                            Kt.column(col) = cm_mul<half>(Kt.column(col), slm_k_scale[kv_row]);
+                            KtNormal.row(col) = Krows_quant_chunk.row(col);
+                            KtNormal.row(col) = KtNormal.row(col) - slm_k_zp[col];
+                            KtNormal.row(col) = cm_mul<half>(KtNormal.row(col), slm_k_scale[col]);
                         }
+#if XE_ARCH==1
+                        Transpose_8x8(KtNormal.format<uint, REG_N, REG_K/2>(), Kt.format<uint, REG_K/2, REG_N>());
+#else
+                        Transpose_8x8(
+                            KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(0,0),
+                            Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
+                        Transpose_8x8(
+                            KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(8,0),
+                            Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
+#endif
                         matrix<half, Q_ROWS_PER_DPAS, REG_K> Qmat_data = Qmat_group.select<Q_ROWS_PER_DPAS,1,REG_K,1>(0, ri * REG_K);
                         matrix<float, Q_ROWS_PER_DPAS, REG_N> rS_data = 0;
                         rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS_PER_DPAS>(
@@ -460,10 +470,16 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     vector<float, ONLINE_TILE_STEPS * REG_N> exp_vals = cm_exp((rS_row - new_max) * log2e_wg);
                     final_sum[row] += cm_sum<float>(exp_vals);
                     final_max[row] = new_max;
+                    P_tile[row] = exp_vals;
                 }
 
-                const int ki = ki_base;
-                if (ki < KV_PARTITION_STEP_NUM) {
+                #pragma unroll
+                for (int li_v = 0; li_v < ONLINE_TILE_STEPS; li_v++) {
+                    const int ki = ki_base + li_v;
+                    if (ki >= KV_PARTITION_STEP_NUM) {
+                        continue;
+                    }
+
                     bool block_valid = false;
                     uint v_base_offset = 0;
                     uint kv_pos_end_in_block = 0;
@@ -510,19 +526,14 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     }
 
                     cm_slm_fence(CM_LOCAL_BARRIER);
-
+                    cm_barrier();
                     vector<half, REG_K> slm_v_scale;
                     vector<half, REG_K> slm_v_zp;
                     cm_slm_block_read(slm_V_scale0, GENX_DWALIGNED, 0, slm_v_scale);
                     cm_slm_block_read(slm_V_zp0, GENX_DWALIGNED, 0, slm_v_zp);
 
-                    matrix<half, Q_ROWS_PER_DPAS, REG_K> Pmat_data;
-                    #pragma unroll
-                    for (int row = 0; row < Q_ROWS_PER_DPAS; row++) {
-                        auto rs_row = rS_tile[row].format<float>();
-                        vector<float, REG_K> p_block = cm_exp((rs_row.select<REG_K, 1>(0) - final_max[row]) * log2e_wg);
-                        Pmat_data.row(row) = p_block;
-                    }
+                    matrix<half, Q_ROWS_PER_DPAS, REG_K> Pmat_data =
+                        P_tile.select<Q_ROWS_PER_DPAS, 1, REG_K, 1>(0, li_v * REG_N);
 
                     for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
                         matrix<uint8_t, REG_K, REG_N> Vrows_quant_chunk;
