@@ -129,7 +129,7 @@ def _run_perf_with_runner_exp(runner, case: SmallQCase, loop_cnt: int = 60, warm
     }
 
 
-def _benchmark_small_q_online_exp(case: SmallQCase) -> PerfResult:
+def _benchmark_small_q_online_exp(case: SmallQCase, q_dpas_per_thread: int = 1) -> PerfResult:
     old_force = os.environ.get("OV_FORCE_Q_HEAD_CHUNK_SIZE")
     old_shared = os.environ.get("OV_EXP_USE_WG_SHARED_KV")
     os.environ["OV_FORCE_Q_HEAD_CHUNK_SIZE"] = "4"
@@ -144,6 +144,7 @@ def _benchmark_small_q_online_exp(case: SmallQCase) -> PerfResult:
             case.kv_cache_compression,
             tile_q=case.tile_q,
             k_partition_block_num=case.partition_block_num,
+            q_dpas_per_thread=q_dpas_per_thread,
         )
 
         data = _build_small_q_inputs(case)
@@ -211,7 +212,8 @@ def _benchmark_small_q_online_exp(case: SmallQCase) -> PerfResult:
 @pytest.mark.parametrize("q_len", [16])
 @pytest.mark.parametrize("cmpr", [1])
 @pytest.mark.parametrize("tile_q", [16])
-def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int, tile_q: int):
+@pytest.mark.parametrize("q_dpas_per_thread", [1, 2])
+def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int, tile_q: int, q_dpas_per_thread: int):
     """Profile the experimental pa_small_q_ov_exp kernel at the 6-2-6 point."""
     if os.environ.get("RUN_PA_PERF", "0") != "1":
         pytest.skip("Set RUN_PA_PERF=1 to enable perf test")
@@ -227,6 +229,6 @@ def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int, tile_q: int
         tile_q=tile_q,
         partition_block_num=16,
     )
-    result = _benchmark_small_q_online_exp(case)
+    result = _benchmark_small_q_online_exp(case, q_dpas_per_thread=q_dpas_per_thread)
     result_id = next(_RESULT_COUNTER)
-    print(f"\n[Result #{result_id:02d}] {result}")
+    print(f"\n[Result #{result_id:02d}] q_dpas_per_thread={q_dpas_per_thread} {result}")

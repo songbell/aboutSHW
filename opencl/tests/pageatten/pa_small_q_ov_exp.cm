@@ -66,11 +66,18 @@ namespace KERNEL_NAME {
         #error "Q_ROWS > 8 requires Q_ROWS to be divisible by 8"
     #endif
     #define Q_ROWS_PER_DPAS 8
-    #define Q_ROW_GROUPS (Q_ROWS / Q_ROWS_PER_DPAS)
 #else
     #define Q_ROWS_PER_DPAS Q_ROWS
-    #define Q_ROW_GROUPS 1
 #endif
+
+#ifndef Q_DPAS_PER_THREAD
+#define Q_DPAS_PER_THREAD 1
+#endif
+#define ROWS_PER_THREAD (Q_ROWS_PER_DPAS * Q_DPAS_PER_THREAD)
+#if (Q_ROWS % ROWS_PER_THREAD) != 0
+    #error "Q_ROWS must be divisible by ROWS_PER_THREAD"
+#endif
+#define Q_ROW_GROUPS (Q_ROWS / ROWS_PER_THREAD)
 
 #define ONLINE_TILE_STEPS 1
 #define NUM_ONLINE_TILES ((KV_PARTITION_STEP_NUM + ONLINE_TILE_STEPS - 1) / ONLINE_TILE_STEPS)
@@ -177,23 +184,19 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             return;
         }
 
-        constexpr uint K_CHUNK_BYTES = ONLINE_TILE_STEPS * REG_N * HEAD_SIZE * sizeof(uint8_t);
-        constexpr uint V_CHUNK_BYTES = REG_K * HEAD_SIZE * sizeof(uint8_t);
-        constexpr uint K_SCALE_BYTES = ONLINE_TILE_STEPS * REG_N * sizeof(half);
-        constexpr uint V_SCALE_BYTES = REG_K * sizeof(half);
-        cm_slm_init(K_CHUNK_BYTES + V_CHUNK_BYTES + 2 * K_SCALE_BYTES + 2 * V_SCALE_BYTES);
+        constexpr uint K_SLOT_BYTES = REG_N * HEAD_SIZE * sizeof(uint8_t);
+        constexpr uint V_SLOT_BYTES = REG_K * HEAD_SIZE * sizeof(uint8_t);
+        constexpr uint K_CHUNK_BYTES = 2 * K_SLOT_BYTES;
+        constexpr uint V_CHUNK_BYTES = 2 * V_SLOT_BYTES;
+        cm_slm_init(K_CHUNK_BYTES + V_CHUNK_BYTES);
         auto slm_K = cm_slm_alloc(K_CHUNK_BYTES);
         auto slm_V0 = cm_slm_alloc(V_CHUNK_BYTES);
-        auto slm_K_scale = cm_slm_alloc(K_SCALE_BYTES);
-        auto slm_K_zp = cm_slm_alloc(K_SCALE_BYTES);
-        auto slm_V_scale0 = cm_slm_alloc(V_SCALE_BYTES);
-        auto slm_V_zp0 = cm_slm_alloc(V_SCALE_BYTES);
 
-        const uint subgroup_row_base = local_qg * Q_ROWS_PER_DPAS;
-        matrix<half, Q_ROWS_PER_DPAS, HEAD_SIZE> Qmat_group = 0;
-        #if (Q_ROWS_PER_DPAS % Q_head_chunk_size) == 0
+        const uint subgroup_row_base = local_qg * ROWS_PER_THREAD;
+        matrix<half, ROWS_PER_THREAD, HEAD_SIZE> Qmat_group = 0;
+        #if (ROWS_PER_THREAD % Q_head_chunk_size) == 0
         #pragma unroll
-        for (int tg = 0; tg < (Q_ROWS_PER_DPAS / Q_head_chunk_size); tg++) {
+        for (int tg = 0; tg < (ROWS_PER_THREAD / Q_head_chunk_size); tg++) {
             const int global_row = subgroup_row_base + tg * Q_head_chunk_size;
             const int t = global_row / Q_head_chunk_size;
             if (t >= (int)valid_count) {
@@ -207,7 +210,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         }
         #else
         #pragma unroll
-        for (int row = 0; row < Q_ROWS_PER_DPAS; row++) {
+        for (int row = 0; row < ROWS_PER_THREAD; row++) {
             const int global_row = subgroup_row_base + row;
             const int t = global_row / Q_head_chunk_size;
             const int qi = global_row % Q_head_chunk_size;
@@ -224,7 +227,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 
         if (kv_partition_idx >= seq_kv_partition_num) {
             #pragma unroll
-            for (int row = 0; row < Q_ROWS_PER_DPAS; row++) {
+            for (int row = 0; row < ROWS_PER_THREAD; row++) {
                 const int global_row = subgroup_row_base + row;
                 const int t = global_row / Q_head_chunk_size;
                 const int qi = global_row % Q_head_chunk_size;
@@ -248,7 +251,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         const uint start_block_idx = block_begin + kv_partition_idx * blocks_per_partition;
         if (kv_partition_idx * KV_PARTITION_SIZE >= kv_len_max || start_block_idx >= block_end) {
             #pragma unroll
-            for (int row = 0; row < Q_ROWS_PER_DPAS; row++) {
+            for (int row = 0; row < ROWS_PER_THREAD; row++) {
                 const int global_row = subgroup_row_base + row;
                 const int t = global_row / Q_head_chunk_size;
                 const int qi = global_row % Q_head_chunk_size;
@@ -281,9 +284,9 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 
         constexpr float log2e_wg = 1.4426950408889634f;
         constexpr float loge2_wg = 0.6931471805599453f;
-        vector<float, Q_ROWS_PER_DPAS> final_max = -3e38f;
-        vector<float, Q_ROWS_PER_DPAS> final_sum = 0.0f;
-        matrix<float, Q_ROWS_PER_DPAS, HEAD_SIZE> Omat = 0;
+        vector<float, ROWS_PER_THREAD> final_max = -3e38f;
+        vector<float, ROWS_PER_THREAD> final_sum = 0.0f;
+        matrix<float, ROWS_PER_THREAD, HEAD_SIZE> Omat = 0;
 
         {
             const uint partition_valid = (leftover_size > 0) ? leftover_size : (uint)KV_PARTITION_SIZE;
@@ -306,55 +309,21 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 kv_pos_end_cache[ki] = kv_pos_end_in_block;
             }
 
-            #pragma unroll
-            for (int online_tile = 0; online_tile < NUM_ONLINE_TILES; online_tile++) {
-                const int ki_base = online_tile * ONLINE_TILE_STEPS;
-                matrix<float, Q_ROWS_PER_DPAS, ONLINE_TILE_STEPS * REG_N> rS_tile = 0;
-                matrix<half, Q_ROWS_PER_DPAS, ONLINE_TILE_STEPS * REG_N> P_tile = 0;
+            // Prime slot-0 payload so iteration 0 can wait/consume while staging slot-1.
+            if (NUM_ONLINE_TILES > 0) {
+                const int ki0 = 0;
+                const uint slot_k_base = 0;
+                const uint slot_v_base = 0;
 
-                if (local_qg == 0) {
-                    #pragma unroll
-                    for (int li = 0; li < ONLINE_TILE_STEPS; li++) {
-                        vector<half, REG_N> k_scale_local = 0.0f;
-                        vector<half, REG_N> k_zp_local = 0.0f;
-                        const int ki = ki_base + li;
-                        if (ki < KV_PARTITION_STEP_NUM) {
-                            const uint block_idx = ki;
-                            if (block_idx < block_num) {
-                                const uint blk_indices = block_indices[start_block_idx + block_idx];
-                                const uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
-                                const uint k_scale_zp_offset = k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
-                                vector<uint, KV_BLOCK_SIZE> k_scale_zp_block;
-                                cm_svm_block_read<uint, KV_BLOCK_SIZE>((svmptr_t)(key + k_scale_zp_offset), k_scale_zp_block);
-                                auto k_scale_zp_half = k_scale_zp_block.format<half>();
-                                const uint kv_pos_end_in_block = kv_pos_end_cache[ki];
-
-                                #pragma unroll
-                                for (int col = 0; col < REG_N; col++) {
-                                    if ((uint)col < kv_pos_end_in_block) {
-                                        k_scale_local[col] = k_scale_zp_half[col];
-                                        k_zp_local[col] = k_scale_zp_half[KV_BLOCK_SIZE + col];
-                                    }
-                                }
-                            }
-                        }
-                        cm_slm_block_write(slm_K_scale, li * REG_N * sizeof(half), k_scale_local.format<half>());
-                        cm_slm_block_write(slm_K_zp, li * REG_N * sizeof(half), k_zp_local.format<half>());
-                    }
-                }
-                // Cooperative K staging for current online tile only.
                 #pragma unroll
-                for (int flat_row = local_qg; flat_row < ONLINE_TILE_STEPS * REG_N; flat_row += Q_ROW_GROUPS) {
-                    const int li = flat_row / REG_N;
-                    const int col = flat_row - li * REG_N;
-                    const int ki = ki_base + li;
+                for (int col = local_qg; col < REG_N; col += Q_ROW_GROUPS) {
                     vector<uint8_t, HEAD_SIZE> k_row = 0;
-                    if (ki < KV_PARTITION_STEP_NUM) {
-                        const uint block_idx = ki;
+                    if (ki0 < KV_PARTITION_STEP_NUM) {
+                        const uint block_idx = ki0;
                         if (block_idx < block_num) {
                             const uint blk_indices = block_indices[start_block_idx + block_idx];
                             const uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
-                            const uint kv_pos_end_in_block = kv_pos_end_cache[ki];
+                            const uint kv_pos_end_in_block = kv_pos_end_cache[ki0];
                             if ((uint)col < kv_pos_end_in_block) {
                                 cm_svm_block_read<uint8_t, HEAD_SIZE>(
                                     (svmptr_t)(key + k_base_offset + col * HEAD_SIZE),
@@ -362,26 +331,135 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             }
                         }
                     }
-                    cm_slm_block_write(slm_K, (li * REG_N + col) * HEAD_SIZE * sizeof(uint8_t), k_row.format<uint8_t>());
+                    cm_slm_block_write(slm_K, slot_k_base + col * HEAD_SIZE * sizeof(uint8_t), k_row.format<uint8_t>());
                 }
+
+                bool block_valid0 = false;
+                uint v_base_offset0 = 0;
+                uint kv_pos_end_in_block0 = 0;
+                if (ki0 < KV_PARTITION_STEP_NUM) {
+                    const uint block_idx = ki0;
+                    if (block_idx < block_num) {
+                        block_valid0 = true;
+                        const uint blk_indices = block_indices[start_block_idx + block_idx];
+                        v_base_offset0 = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
+                        kv_pos_end_in_block0 = kv_pos_end_cache[ki0];
+                    }
+                }
+                #pragma unroll
+                for (int r = local_qg; r < REG_K; r += Q_ROW_GROUPS) {
+                    vector<uint8_t, HEAD_SIZE> v_row = 0;
+                    if (block_valid0 && (uint)r < kv_pos_end_in_block0) {
+                        cm_svm_block_read<uint8_t, HEAD_SIZE>(
+                            (svmptr_t)(value + v_base_offset0 + r * HEAD_SIZE),
+                            v_row.format<uint8_t>());
+                    }
+                    cm_slm_block_write(slm_V0, slot_v_base + r * HEAD_SIZE * sizeof(uint8_t), v_row.format<uint8_t>());
+                }
+
                 cm_slm_fence(CM_LOCAL_BARRIER);
                 cm_barrier();
+            }
+
+            #pragma unroll
+            for (int online_tile = 0; online_tile < NUM_ONLINE_TILES; online_tile++) {
+                const int ki_base = online_tile * ONLINE_TILE_STEPS;
+                const int slot = online_tile & 1;
+                const uint slot_k_base = slot * K_SLOT_BYTES;
+                const uint slot_v_base = slot * V_SLOT_BYTES;
+
+                matrix<float, ROWS_PER_THREAD, ONLINE_TILE_STEPS * REG_N> rS_tile = 0;
+                matrix<half, ROWS_PER_THREAD, ONLINE_TILE_STEPS * REG_N> P_tile = 0;
+
+                cm_fence(CM_LOCAL_BARRIER);
+                cm_barrier();
+
+                const int next_tile = online_tile + 1;
+                if (next_tile < NUM_ONLINE_TILES) {
+                    const int next_slot = next_tile & 1;
+                    const uint next_slot_k_base = next_slot * K_SLOT_BYTES;
+                    const uint next_slot_v_base = next_slot * V_SLOT_BYTES;
+                    const int ki_next = next_tile * ONLINE_TILE_STEPS;
+
+                    #pragma unroll
+                    for (int col = local_qg; col < REG_N; col += Q_ROW_GROUPS) {
+                        vector<uint8_t, HEAD_SIZE> k_row = 0;
+                        if (ki_next < KV_PARTITION_STEP_NUM) {
+                            const uint block_idx = ki_next;
+                            if (block_idx < block_num) {
+                                const uint blk_indices = block_indices[start_block_idx + block_idx];
+                                const uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
+                                const uint kv_pos_end_in_block = kv_pos_end_cache[ki_next];
+                                if ((uint)col < kv_pos_end_in_block) {
+                                    cm_svm_block_read<uint8_t, HEAD_SIZE>(
+                                        (svmptr_t)(key + k_base_offset + col * HEAD_SIZE),
+                                        k_row.format<uint8_t>());
+                                }
+                            }
+                        }
+                        cm_slm_block_write(slm_K, next_slot_k_base + col * HEAD_SIZE * sizeof(uint8_t), k_row.format<uint8_t>());
+                    }
+
+                    bool block_valid_next = false;
+                    uint v_base_offset_next = 0;
+                    uint kv_pos_end_in_block_next = 0;
+                    if (ki_next < KV_PARTITION_STEP_NUM) {
+                        const uint block_idx = ki_next;
+                        if (block_idx < block_num) {
+                            block_valid_next = true;
+                            const uint blk_indices = block_indices[start_block_idx + block_idx];
+                            v_base_offset_next = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
+                            kv_pos_end_in_block_next = kv_pos_end_cache[ki_next];
+                        }
+                    }
+                    #pragma unroll
+                    for (int r = local_qg; r < REG_K; r += Q_ROW_GROUPS) {
+                        vector<uint8_t, HEAD_SIZE> v_row = 0;
+                        if (block_valid_next && (uint)r < kv_pos_end_in_block_next) {
+                            cm_svm_block_read<uint8_t, HEAD_SIZE>(
+                                (svmptr_t)(value + v_base_offset_next + r * HEAD_SIZE),
+                                v_row.format<uint8_t>());
+                        }
+                        cm_slm_block_write(slm_V0, next_slot_v_base + r * HEAD_SIZE * sizeof(uint8_t), v_row.format<uint8_t>());
+                    }
+
+                    cm_slm_fence(CM_LOCAL_BARRIER);
+                    cm_barrier();
+                }
+
                 #pragma unroll
                 for (int li = 0; li < ONLINE_TILE_STEPS; li++) {
                     const int ki = ki_base + li;
                     if (ki >= KV_PARTITION_STEP_NUM) {
                         continue;
                     }
-                    vector<half, REG_N> slm_k_scale;
-                    vector<half, REG_N> slm_k_zp;
-                    cm_slm_block_read(slm_K_scale, GENX_DWALIGNED, li * REG_N * sizeof(half), slm_k_scale);
-                    cm_slm_block_read(slm_K_zp, GENX_DWALIGNED, li * REG_N * sizeof(half), slm_k_zp);
+                    vector<half, REG_N> slm_k_scale = 0.0f;
+                    vector<half, REG_N> slm_k_zp = 0.0f;
+                    {
+                        const uint block_idx = ki;
+                        if (block_idx < block_num) {
+                            const uint blk_indices = block_indices[start_block_idx + block_idx];
+                            const uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
+                            const uint k_scale_zp_offset = k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
+                            vector<uint, KV_BLOCK_SIZE> k_scale_zp_block;
+                            cm_svm_block_read<uint, KV_BLOCK_SIZE>((svmptr_t)(key + k_scale_zp_offset), k_scale_zp_block);
+                            auto k_scale_zp_half = k_scale_zp_block.format<half>();
+                            const uint kv_pos_end_in_block = kv_pos_end_cache[ki];
+                            #pragma unroll
+                            for (int col = 0; col < REG_N; col++) {
+                                if ((uint)col < kv_pos_end_in_block) {
+                                    slm_k_scale[col] = k_scale_zp_half[col];
+                                    slm_k_zp[col] = k_scale_zp_half[KV_BLOCK_SIZE + col];
+                                }
+                            }
+                        }
+                    }
 
                     for (int k = 0, ri = 0; k < HEAD_SIZE / REG_K; k += 1, ri++) {
                         matrix<uint8_t, REG_N, REG_K> Krows_quant_chunk;
                         #pragma unroll
                         for (int col = 0; col < REG_N; col++) {
-                            const uint k_chunk_offset = ((li * REG_N + col) * HEAD_SIZE + ri * REG_K) * sizeof(uint8_t);
+                            const uint k_chunk_offset = slot_k_base + ((li * REG_N + col) * HEAD_SIZE + ri * REG_K) * sizeof(uint8_t);
                             cm_slm_block_read(slm_K, GENX_DWALIGNED, k_chunk_offset, Krows_quant_chunk.row(col).format<uint8_t>());
                         }
                         matrix<half, REG_K, REG_N> Kt = 0;
@@ -402,13 +480,16 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(8,0),
                             Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
 #endif
-                        matrix<half, Q_ROWS_PER_DPAS, REG_K> Qmat_data = Qmat_group.select<Q_ROWS_PER_DPAS,1,REG_K,1>(0, ri * REG_K);
-                        matrix<float, Q_ROWS_PER_DPAS, REG_N> rS_data = 0;
-                        rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS_PER_DPAS>(
-                                    rS_data.format<float>(),
-                                    Kt.format<int32_t>(),
-                                    Qmat_data.format<int32_t>());
-                        rS_tile.select<Q_ROWS_PER_DPAS, 1, REG_N, 1>(0, li * REG_N) += rS_data;
+                        #pragma unroll
+                        for (int pass = 0; pass < Q_DPAS_PER_THREAD; pass++) {
+                            matrix<half, Q_ROWS_PER_DPAS, REG_K> Qmat_data = Qmat_group.select<Q_ROWS_PER_DPAS,1,REG_K,1>(pass * Q_ROWS_PER_DPAS, ri * REG_K);
+                            matrix<float, Q_ROWS_PER_DPAS, REG_N> rS_data = 0;
+                            rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS_PER_DPAS>(
+                                        rS_data.format<float>(),
+                                        Kt.format<int32_t>(),
+                                        Qmat_data.format<int32_t>());
+                            rS_tile.select<Q_ROWS_PER_DPAS, 1, REG_N, 1>(pass * Q_ROWS_PER_DPAS, li * REG_N) += rS_data;
+                        }
                     }
                 }
 
@@ -422,7 +503,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     const float NEG_INF = -3.4e38f;
 
                     #pragma unroll
-                    for (int row = 0; row < Q_ROWS_PER_DPAS; ++row) {
+                    for (int row = 0; row < ROWS_PER_THREAD; ++row) {
                         const int global_row = subgroup_row_base + row;
                         const int t = global_row / Q_head_chunk_size;
                         const int kv_len_t = (t < (int)valid_count) ? (int)(past_q_lens + q_start + t + 1) : 0;
@@ -452,7 +533,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 }
 
                 #pragma unroll
-                for (int row = 0; row < Q_ROWS_PER_DPAS; row++) {
+                for (int row = 0; row < ROWS_PER_THREAD; row++) {
                     auto rS_row = rS_tile[row].format<float>();
 #if XE_ARCH==1
                     float tile_max = cm_reduced_max<float>(rS_row);
@@ -489,57 +570,29 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         const uint blk_indices = block_indices[start_block_idx + block_idx];
                         v_base_offset = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
                         kv_pos_end_in_block = kv_pos_end_cache[ki];
+                    }
 
-                        if (local_qg == 0) {
-                            vector<half, REG_K> v_scale_local = 0.0f;
-                            vector<half, REG_K> v_zp_local = 0.0f;
-                            const uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
-                            vector<uint, KV_BLOCK_SIZE> v_scale_zp_block;
-                            cm_svm_block_read<uint, KV_BLOCK_SIZE>((svmptr_t)(value + v_scale_zp_offset), v_scale_zp_block);
-                            auto v_scale_zp_half = v_scale_zp_block.format<half>();
-                            #pragma unroll
-                            for (int r = 0; r < REG_K; r++) {
-                                if ((uint)r < kv_pos_end_in_block) {
-                                    v_scale_local[r] = v_scale_zp_half[r];
-                                    v_zp_local[r] = v_scale_zp_half[KV_BLOCK_SIZE + r];
-                                }
+                    vector<half, REG_K> slm_v_scale = 0.0f;
+                    vector<half, REG_K> slm_v_zp = 0.0f;
+                    if (block_valid) {
+                        const uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
+                        vector<uint, KV_BLOCK_SIZE> v_scale_zp_block;
+                        cm_svm_block_read<uint, KV_BLOCK_SIZE>((svmptr_t)(value + v_scale_zp_offset), v_scale_zp_block);
+                        auto v_scale_zp_half = v_scale_zp_block.format<half>();
+                        #pragma unroll
+                        for (int r = 0; r < REG_K; r++) {
+                            if ((uint)r < kv_pos_end_in_block) {
+                                slm_v_scale[r] = v_scale_zp_half[r];
+                                slm_v_zp[r] = v_scale_zp_half[KV_BLOCK_SIZE + r];
                             }
-                            cm_slm_block_write(slm_V_scale0, 0, v_scale_local.format<half>());
-                            cm_slm_block_write(slm_V_zp0, 0, v_zp_local.format<half>());
                         }
-                    } else if (local_qg == 0) {
-                        vector<half, REG_K> v_scale_local = 0.0f;
-                        vector<half, REG_K> v_zp_local = 0.0f;
-                        cm_slm_block_write(slm_V_scale0, 0, v_scale_local.format<half>());
-                        cm_slm_block_write(slm_V_zp0, 0, v_zp_local.format<half>());
                     }
-
-                    #pragma unroll
-                    for (int r = local_qg; r < REG_K; r += Q_ROW_GROUPS) {
-                        vector<uint8_t, HEAD_SIZE> v_row = 0;
-                        if (block_valid && (uint)r < kv_pos_end_in_block) {
-                            cm_svm_block_read<uint8_t, HEAD_SIZE>(
-                                (svmptr_t)(value + v_base_offset + r * HEAD_SIZE),
-                                v_row.format<uint8_t>());
-                        }
-                        cm_slm_block_write(slm_V0, r * HEAD_SIZE * sizeof(uint8_t), v_row.format<uint8_t>());
-                    }
-
-                    cm_slm_fence(CM_LOCAL_BARRIER);
-                    cm_barrier();
-                    vector<half, REG_K> slm_v_scale;
-                    vector<half, REG_K> slm_v_zp;
-                    cm_slm_block_read(slm_V_scale0, GENX_DWALIGNED, 0, slm_v_scale);
-                    cm_slm_block_read(slm_V_zp0, GENX_DWALIGNED, 0, slm_v_zp);
-
-                    matrix<half, Q_ROWS_PER_DPAS, REG_K> Pmat_data =
-                        P_tile.select<Q_ROWS_PER_DPAS, 1, REG_K, 1>(0, li_v * REG_N);
 
                     for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
                         matrix<uint8_t, REG_K, REG_N> Vrows_quant_chunk;
                         #pragma unroll
                         for (int r = 0; r < REG_K; r++) {
-                            const uint v_chunk_offset = (r * HEAD_SIZE + k) * sizeof(uint8_t);
+                            const uint v_chunk_offset = slot_v_base + (r * HEAD_SIZE + k) * sizeof(uint8_t);
                             cm_slm_block_read(slm_V0, GENX_DWALIGNED, v_chunk_offset, Vrows_quant_chunk.row(r).format<uint8_t>());
                         }
                         matrix<half, REG_K, REG_N> VmatNormal;
@@ -555,26 +608,36 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         Vref.select<REG_K/2, 1, REG_N, 2>(0, 0) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(0, 0);
                         Vref.select<REG_K/2, 1, REG_N, 2>(0, 1) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(1, 0);
 
-                        auto Omat_data = Omat.select<Q_ROWS_PER_DPAS,1,REG_N,1>(0, ri * REG_N);
-                        Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS_PER_DPAS>(
-                                    Omat_data.format<float>(),
-                                    Vmat.format<int32_t>(),
-                                    Pmat_data.format<int32_t>());
+                        #pragma unroll
+                        for (int pass = 0; pass < Q_DPAS_PER_THREAD; pass++) {
+                            matrix<half, Q_ROWS_PER_DPAS, REG_K> Pmat_data =
+                                P_tile.select<Q_ROWS_PER_DPAS, 1, REG_K, 1>(pass * Q_ROWS_PER_DPAS, li_v * REG_N);
+                            auto Omat_data = Omat.select<Q_ROWS_PER_DPAS,1,REG_N,1>(pass * Q_ROWS_PER_DPAS, ri * REG_N);
+                            Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS_PER_DPAS>(
+                                        Omat_data.format<float>(),
+                                        Vmat.format<int32_t>(),
+                                        Pmat_data.format<int32_t>());
+                        }
                     }
                 }
+
+                // 2-slot ring safety: all threads must finish consuming current slot
+                // before any thread starts the next iteration and reuses that slot.
+                cm_fence(CM_LOCAL_BARRIER);
+                cm_barrier();
             }
         }
 
-        vector<float, Q_ROWS_PER_DPAS> cur_lse;
+        vector<float, ROWS_PER_THREAD> cur_lse;
         #pragma unroll
-        for (int row = 0; row < Q_ROWS_PER_DPAS; row++) {
+        for (int row = 0; row < ROWS_PER_THREAD; row++) {
             cur_lse[row] = (final_sum[row] > 0.0f)
                            ? (cm_log<float>(final_sum[row]) * loge2_wg + final_max[row])
                            : -3e38f;
         }
 
         #pragma unroll
-        for (int row = 0; row < Q_ROWS_PER_DPAS; row++) {
+        for (int row = 0; row < ROWS_PER_THREAD; row++) {
             const int global_row = subgroup_row_base + row;
             const int t = global_row / Q_head_chunk_size;
             const int qi = global_row % Q_head_chunk_size;
