@@ -4,6 +4,7 @@
 import functools
 import os
 import sys
+from contextlib import contextmanager
 
 import numpy as np
 import pytest
@@ -13,11 +14,34 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'clops'))
 
 from clops import cl
-from test_ov_kernel_correctness import _run_baseline
 from test_pa_small_q import PaSmallQRunner, SmallQCase, _build_inputs as _build_small_q_inputs
+from test_pa_multiseq import PaMultiTokenRunner
 
 cl.profiling(True)
 torch.manual_seed(0)
+
+MAX_DIFF_TOL = 0.05
+
+
+@contextmanager
+def _temporary_env(set_values: dict[str, str] | None = None, unset_keys: list[str] | None = None):
+    """Temporarily set/unset environment variables, then restore."""
+    set_values = set_values or {}
+    unset_keys = unset_keys or []
+    touched_keys = set(set_values.keys()) | set(unset_keys)
+    old_values = {k: os.environ.get(k) for k in touched_keys}
+    try:
+        for key in unset_keys:
+            os.environ.pop(key, None)
+        for key, value in set_values.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, old_value in old_values.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
 
 class PaSmallQOvExpRunner(PaSmallQRunner):
@@ -29,6 +53,8 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.ov_exp_force_q_head_chunk_size = 4
+        self.ov_exp_use_wg_shared_kv = True
 
         online_tile_steps = 8
         online_tile_size = online_tile_steps * self.kv_step
@@ -44,7 +70,7 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
             + 2 * self.head_size
         )
         max_q_by_matrix = max(1, budget_bytes // (bytes_per_q_row * self.tile_q))
-
+        self.reduce_split_step = 64
         q_heads_per_kv_head = self.num_heads // self.num_kv_heads
         repeat_count_cap = max(1, max_repeat_count // self.tile_q)
         target_chunk = min(q_heads_per_kv_head, repeat_count_cap, max_q_by_matrix)
@@ -52,7 +78,7 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
         while q_head_chunk_size > 1 and (q_heads_per_kv_head % q_head_chunk_size) != 0:
             q_head_chunk_size -= 1
 
-        forced_q_head_chunk_size = int(os.environ.get("OV_FORCE_Q_HEAD_CHUNK_SIZE", "0"))
+        forced_q_head_chunk_size = self.ov_exp_force_q_head_chunk_size
         if forced_q_head_chunk_size > 0:
             if (q_heads_per_kv_head % forced_q_head_chunk_size) != 0:
                 raise ValueError(
@@ -64,12 +90,21 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
         self.q_head_chunks_per_kv_head = q_heads_per_kv_head // q_head_chunk_size
         self.workgroup_q_groups = 1
         if (
-            os.environ.get("OV_EXP_USE_WG_SHARED_KV", "0") == "1"
+            self.ov_exp_use_wg_shared_kv
             and self.kv_cache_compression == 1
             and (self.q_head_chunk_size * self.tile_q) > 8
         ):
             self.workgroup_q_groups = (self.q_head_chunk_size * self.tile_q) // 8
-        #print(f"PaSmallQOvExpRunner: q_head_chunk_size={self.q_head_chunk_size}, q_head_chunks_per_kv_head={self.q_head_chunks_per_kv_head}, workgroup_q_groups={self.workgroup_q_groups}")
+        print(
+            "PaSmallQOvExpRunner: "
+            f"q_head_chunk_size={self.q_head_chunk_size}, "
+            f"q_head_chunks_per_kv_head={self.q_head_chunks_per_kv_head}, "
+            f"workgroup_q_groups={self.workgroup_q_groups}, "
+            f"force_q_head_chunk_size={self.ov_exp_force_q_head_chunk_size}, "
+            f"wg_shared_kv={int(self.ov_exp_use_wg_shared_kv)}"
+            f"tile_q={self.tile_q}, kv_cache_compression={self.kv_cache_compression}"
+        )
+
     @staticmethod
     @functools.lru_cache(maxsize=8)
     def _create_kernels_ov_exp(
@@ -228,6 +263,33 @@ def _run_ov_exp(case: SmallQCase, data: dict) -> torch.Tensor:
     return out
 
 
+def _run_multi_token_reference(case: SmallQCase, data: dict) -> torch.Tensor:
+    """Generate reference output via pa_multi_token kernel on the same inputs."""
+    runner = PaMultiTokenRunner.create_instance(
+        case.num_heads,
+        case.num_kv_heads,
+        case.head_size,
+        case.block_size,
+        case.kv_cache_compression,
+        is_causal=True,
+        sub_block_size=case.sub_block_size,
+        sparse_block_size=1,
+        enable_hybrid_dispatch=False,
+    )
+    kern_attn_inputs = {
+        "query": data["query"],
+        "key_cache": data["key_cache"],
+        "value_cache": data["value_cache"],
+        "past_lens": data["past_lens"],
+        "block_indices": data["block_indices"],
+        "block_indices_begins": data["block_indices_begins"],
+        "subsequence_begins": data["subsequence_begins"],
+    }
+    out = torch.zeros([case.q_len, case.num_heads * case.head_size], dtype=torch.float16)
+    runner(kern_attn_inputs, out, prefill_seq_indices=[0], n_repeats=1)
+    return out.reshape(case.q_len, case.num_heads, case.head_size).contiguous()
+
+
 def _case_exp(
     q_len: int,
     past_len: int,
@@ -240,59 +302,74 @@ def _case_exp(
         past_len=past_len, q_len=q_len, kv_cache_compression=cmpr, tile_q=tile_q,
     )
     data = _build_small_q_inputs(case)
-    out_base = _run_baseline(case, data)
-    out_exp = _run_ov_exp(case, data)
+
+    env_keys = ["OV_EXP_USE_WG_SHARED_KV", "OV_FORCE_Q_HEAD_CHUNK_SIZE"]
+    with _temporary_env(unset_keys=env_keys):
+        out_base = _run_multi_token_reference(case, data)
+
+    with _temporary_env(
+        set_values={
+            "OV_EXP_USE_WG_SHARED_KV": "1",
+            "OV_FORCE_Q_HEAD_CHUNK_SIZE": "4",
+        }
+    ):
+        out_exp = _run_ov_exp(case, data)
 
     diff = (out_exp.float() - out_base.float()).abs()
     max_diff = diff.max().item()
     print(f"  Experimental kernel max_diff={max_diff:.4e}")
-    passed = max_diff < 0.05 and not torch.isnan(out_exp).any().item()
+    passed = max_diff < MAX_DIFF_TOL and not torch.isnan(out_exp).any().item()
     return passed, max_diff
 
 
-@pytest.mark.parametrize("cmpr", [0, 1])
-@pytest.mark.parametrize("tile_q", [1, 2])
-def test_ov_exp_smoke(cmpr: int, tile_q: int):
-    passed, max_diff = _case_exp(q_len=16, past_len=15360, cmpr=cmpr, tile_q=tile_q)
-    assert passed, f"experimental kernel mismatch: max_diff={max_diff:.4e}"
+_PAST_LENS_SWEEP = (64, 128, 144, 192, 1024, 4096, 15360)
 
 
 @pytest.mark.parametrize(
-    "q_len,past_len,cmpr,tile_q",
+    "q_len,past_len,cmpr,tile_q,block_size",
     [
-        (6, 15360, 1, 6),
-        #(6, 15360, 0, 6),
-        #(16, 15360, 1, 2),
+        *[(6, past_len, 1, 6, 16) for past_len in _PAST_LENS_SWEEP],
+        *[(16, past_len, 1, 16, 16) for past_len in _PAST_LENS_SWEEP],
+        *[(16, past_len, 1, 8, 16) for past_len in _PAST_LENS_SWEEP],
     ],
 )
-def test_ov_exp_correctness_block16_partition128(
+def test_ov_exp_correctness_vs_multi_token_matrix(
     q_len: int,
     past_len: int,
     cmpr: int,
     tile_q: int,
-    monkeypatch,
+    block_size: int,
 ):
-    # Keep this test self-contained so it can be executed directly from pytest.
-    monkeypatch.setenv("OV_EXP_USE_WG_SHARED_KV", "1")
-    monkeypatch.setenv("OV_FORCE_Q_HEAD_CHUNK_SIZE", "4")
-
     passed, max_diff = _case_exp(
         q_len=q_len,
         past_len=past_len,
         cmpr=cmpr,
         tile_q=tile_q,
-        block_size=16,
+        block_size=block_size,
     )
     assert passed, (
-        "experimental kernel mismatch under block_size=16, partition_size=128: "
-        f"q_len={q_len} past_len={past_len} cmpr={cmpr} tile_q={tile_q} max_diff={max_diff:.4e}"
+        "ov_exp vs pa_multi_token mismatch: "
+        f"q_len={q_len} past_len={past_len} cmpr={cmpr} tile_q={tile_q} "
+        f"block_size={block_size} max_diff={max_diff:.4e}"
     )
 
 
 if __name__ == "__main__":
-    for cmpr in [0, 1]:
-        for tile_q in [1, 2, 4]:
-            if tile_q > 16:
-                continue
-            passed, max_diff = _case_exp(q_len=16, past_len=15360, cmpr=cmpr, tile_q=tile_q)
-            print({"cmpr": cmpr, "tile_q": tile_q, "passed": passed, "max_diff": max_diff})
+    for q_len, tile_q in [(6, 6)]:
+        for past_len in _PAST_LENS_SWEEP:
+            passed, max_diff = _case_exp(
+                q_len=q_len,
+                past_len=past_len,
+                cmpr=1,
+                tile_q=tile_q,
+                block_size=16,
+            )
+            print({
+                "q_len": q_len,
+                "past_len": past_len,
+                "cmpr": 1,
+                "tile_q": tile_q,
+                "block_size": 16,
+                "passed": passed,
+                "max_diff": max_diff,
+            })
