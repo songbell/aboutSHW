@@ -20,6 +20,20 @@ from test_pa_multiseq import PaMultiTokenRunner
 cl.profiling(True)
 torch.manual_seed(0)
 
+# -Qxcm_register_file_size. Valid values are 128 / 160 / 192 / 256; threads resident per
+# XVE is 1280 / this, so 192 gives 6 and 160 gives 8.
+#
+# 192 is not about avoiding spill -- the kernel fits in 150 registers. It is about giving
+# IGC enough slack to *batch* the consume phase's SLM reads. At 160 it emits a strict
+# LDLDLD... chain, one 512 B SLM read immediately followed by its dependent DPAS, 16 times
+# per online tile, so the SLM latency is fully exposed and the workgroup's threads all stall
+# on it together behind the barriers. At 192 it schedules LLLLDDDD -- 4-way memory-level
+# parallelism. Paired A/B on the main kernel, two batches: -8.4 % and -11.3 %. 256 also
+# batches but costs another thread per XVE and measures +2.3 % / -1.0 %.
+#
+# This flipped sign in round 16: before the K/V prefetch landed, 192 measured -0.4 %.
+_DEFAULT_REG_FILE = "192"
+
 MAX_DIFF_TOL = 0.05
 
 
@@ -52,7 +66,6 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
     """
 
     def __init__(self, *args, **kwargs):
-        self.q_dpas_per_thread = int(kwargs.pop("q_dpas_per_thread", 1))
         super().__init__(*args, **kwargs)
         self.ov_exp_force_q_head_chunk_size = 4
         self.ov_exp_use_wg_shared_kv = True
@@ -89,23 +102,26 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
 
         self.q_head_chunk_size = q_head_chunk_size
         self.q_head_chunks_per_kv_head = q_heads_per_kv_head // q_head_chunk_size
-        self.workgroup_q_groups = 1
+        q_rows = self.q_head_chunk_size * self.tile_q
+        # Must match ROWS_PER_THREAD / WG_THREADS in pa_small_q_ov_exp.cm. The kernel
+        # derives them from the same TILE_Q and Q_head_chunk_size, so nothing is threaded
+        # through the build options -- but a mismatch here would be silent, so keep the
+        # two definitions side by side.
+        self.rows_per_thread = 8 if q_rows > 8 else q_rows
+
+        self.wg_threads = 1
         if (
             self.ov_exp_use_wg_shared_kv
             and self.kv_cache_compression == 1
-            and (self.q_head_chunk_size * self.tile_q) > 8
+            and q_rows > 8
         ):
-            total_row_groups = (self.q_head_chunk_size * self.tile_q) // 8
-            if (total_row_groups % self.q_dpas_per_thread) != 0:
-                raise ValueError(
-                    f"q_dpas_per_thread={self.q_dpas_per_thread} must divide row groups={total_row_groups}"
-                )
-            self.workgroup_q_groups = total_row_groups // self.q_dpas_per_thread
+            self.wg_threads = q_rows // self.rows_per_thread
         print(
             "PaSmallQOvExpRunner: "
             f"q_head_chunk_size={self.q_head_chunk_size}, "
             f"q_head_chunks_per_kv_head={self.q_head_chunks_per_kv_head}, "
-            f"workgroup_q_groups={self.workgroup_q_groups}, "
+            f"rows_per_thread={self.rows_per_thread}, "
+            f"wg_threads={self.wg_threads}, "
             f"force_q_head_chunk_size={self.ov_exp_force_q_head_chunk_size}, "
             f"wg_shared_kv={int(self.ov_exp_use_wg_shared_kv)}"
             f"tile_q={self.tile_q}, kv_cache_compression={self.kv_cache_compression}"
@@ -117,7 +133,7 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
         num_heads, num_kv_heads, head_size, kv_step, block_size, sub_block_size,
         kv_partition_size, reduce_split_step, clean_unused_kvcache,
         kv_cache_compression, xe_arch, q_head_chunks_per_kv_head,
-        q_head_chunk_size, tile_q, scale_factor, source_stamp, q_dpas_per_thread,
+        q_head_chunk_size, tile_q, scale_factor, source_stamp,
     ):
         src = '\n'.join([
             '#include "pa_small_q_ov_exp.cm"',
@@ -128,7 +144,7 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
             src,
             f'''-cmc -Qxcm_jit_option=""
                         -mCM_printregusage
-                        -Qxcm_register_file_size=256 -I{cwd}
+                        -Qxcm_register_file_size={os.environ.get("OV_EXP_REG_FILE_SIZE", _DEFAULT_REG_FILE)} -I{cwd}
                         -DHEADS_NUM={num_heads} -DKV_HEADS_NUM={num_kv_heads} -DHEAD_SIZE={head_size}
                         -DQ_STEP=32 -DKV_STEP={kv_step}
                         -DKV_BLOCK_SIZE={block_size}
@@ -141,9 +157,8 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
                         -DQ_head_chunk_size={q_head_chunk_size}
                         -DTILE_Q={tile_q}
                         -DSCALE_FACTOR={scale_factor}
-                        -DQ_DPAS_PER_THREAD={q_dpas_per_thread}
                         -DOV_EXP_SOURCE_STAMP={source_stamp}
-                        -DKERNEL_NAME=cm_pa_small_q''',
+                        -DKERNEL_NAME=cm_pa_small_q {os.environ.get("OV_EXP_EXTRA_FLAGS", "")}''',
         )
 
     def _create_kernels(self):
@@ -166,12 +181,11 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
             self.tile_q,
             self.scale_factor,
             source_stamp,
-            int(self.q_dpas_per_thread),
         )
 
     def dispatch_dims(self, tile_count: int, kv_partition_num: int):
-        gws = [int(tile_count) * self.workgroup_q_groups, self.num_kv_heads * self.q_head_chunks_per_kv_head, kv_partition_num]
-        lws = [self.workgroup_q_groups, 1, 1]
+        gws = [int(tile_count) * self.wg_threads, self.num_kv_heads * self.q_head_chunks_per_kv_head, kv_partition_num]
+        lws = [self.wg_threads, 1, 1]
         #print(f"PaSmallQOvExpRunner.dispatch_dims: gws={gws}, lws={lws}, tile_count={tile_count}, kv_partition_num={kv_partition_num}")
         partition_token_rows = int(tile_count) * self.tile_q
         gws_2 = [partition_token_rows, self.num_heads, self.head_size // self.reduce_split_step]
@@ -255,11 +269,11 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
         return out, t_partition_out, t_lse
 
 
-def _run_ov_exp(case: SmallQCase, data: dict, q_dpas_per_thread: int = 1) -> torch.Tensor:
+def _run_ov_exp(case: SmallQCase, data: dict) -> torch.Tensor:
     runner = PaSmallQOvExpRunner(
         case.num_heads, case.num_kv_heads, case.head_size,
         case.block_size, case.sub_block_size, case.kv_cache_compression,
-        tile_q=case.tile_q, q_dpas_per_thread=q_dpas_per_thread,
+        tile_q=case.tile_q,
     )
     out = torch.zeros([case.q_len, case.num_heads, case.head_size], dtype=torch.float16)
     runner(
@@ -361,21 +375,25 @@ def test_ov_exp_correctness_vs_multi_token_matrix(
 
 
 @pytest.mark.parametrize(
-    "q_len,past_len,cmpr,tile_q,q_dpas_per_thread,block_size",
+    "q_len,past_len,cmpr,tile_q,block_size",
     [
-        *[(16, past_len, 1, 16, 2, 16) for past_len in _PAST_LENS_SWEEP],
+        # The tuned operating point, plus tail tiles. q_len < tile_q leaves some threads
+        # owning rows past valid_count, which is the case the causal/partition mask
+        # fast-path has to opt out of, so it needs explicit coverage.
+        *[(16, past_len, 1, 16, 16) for past_len in _PAST_LENS_SWEEP],
+        *[(q_len, past_len, 1, 16, 16)
+          for q_len in (13, 10, 5) for past_len in (192, 1024, 15360)],
     ],
 )
-def test_ov_exp_correctness_multi_dpas_per_thread(
+def test_ov_exp_correctness_q16_and_tail_tiles(
     q_len: int,
     past_len: int,
     cmpr: int,
     tile_q: int,
-    q_dpas_per_thread: int,
     block_size: int,
 ):
-    """Each thread owns q_dpas_per_thread * Q_ROWS_PER_DPAS rows and issues that
-    many serial DPAS passes over one shared KV load."""
+    """q_len=16 / tile_q=16 is the tuned shape; q_len < tile_q exercises the tail-tile
+    path where a workgroup contains threads whose q-rows are all invalid."""
     case = SmallQCase(
         num_heads=32, num_kv_heads=8, head_size=128, block_size=block_size,
         past_len=past_len, q_len=q_len, kv_cache_compression=cmpr, tile_q=tile_q,
@@ -388,33 +406,11 @@ def test_ov_exp_correctness_multi_dpas_per_thread(
     with _temporary_env(
         set_values={"OV_EXP_USE_WG_SHARED_KV": "1", "OV_FORCE_Q_HEAD_CHUNK_SIZE": "4"}
     ):
-        out_exp = _run_ov_exp(case, data, q_dpas_per_thread=q_dpas_per_thread)
+        out_exp = _run_ov_exp(case, data)
 
     max_diff = (out_exp.float() - out_base.float()).abs().max().item()
-    print(f"  multi-DPAS(q_dpas={q_dpas_per_thread}) max_diff={max_diff:.4e}")
+    print(f"  q_len={q_len} tile_q={tile_q} max_diff={max_diff:.4e}")
     assert max_diff < MAX_DIFF_TOL and not torch.isnan(out_exp).any().item(), (
-        "ov_exp multi-DPAS-per-thread mismatch: "
-        f"q_len={q_len} past_len={past_len} tile_q={tile_q} "
-        f"q_dpas_per_thread={q_dpas_per_thread} max_diff={max_diff:.4e}"
+        "ov_exp mismatch: "
+        f"q_len={q_len} past_len={past_len} tile_q={tile_q} max_diff={max_diff:.4e}"
     )
-
-
-if __name__ == "__main__":
-    for q_len, tile_q in [(6, 6)]:
-        for past_len in _PAST_LENS_SWEEP:
-            passed, max_diff = _case_exp(
-                q_len=q_len,
-                past_len=past_len,
-                cmpr=1,
-                tile_q=tile_q,
-                block_size=16,
-            )
-            print({
-                "q_len": q_len,
-                "past_len": past_len,
-                "cmpr": 1,
-                "tile_q": tile_q,
-                "block_size": 16,
-                "passed": passed,
-                "max_diff": max_diff,
-            })

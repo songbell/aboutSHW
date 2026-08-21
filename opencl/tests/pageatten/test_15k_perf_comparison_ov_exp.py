@@ -129,7 +129,7 @@ def _run_perf_with_runner_exp(runner, case: SmallQCase, loop_cnt: int = 60, warm
     }
 
 
-def _benchmark_small_q_online_exp(case: SmallQCase, q_dpas_per_thread: int = 1) -> PerfResult:
+def _benchmark_small_q_online_exp(case: SmallQCase) -> PerfResult:
     old_force = os.environ.get("OV_FORCE_Q_HEAD_CHUNK_SIZE")
     old_shared = os.environ.get("OV_EXP_USE_WG_SHARED_KV")
     os.environ["OV_FORCE_Q_HEAD_CHUNK_SIZE"] = "4"
@@ -144,7 +144,6 @@ def _benchmark_small_q_online_exp(case: SmallQCase, q_dpas_per_thread: int = 1) 
             case.kv_cache_compression,
             tile_q=case.tile_q,
             k_partition_block_num=case.partition_block_num,
-            q_dpas_per_thread=q_dpas_per_thread,
         )
 
         data = _build_small_q_inputs(case)
@@ -209,11 +208,14 @@ def _benchmark_small_q_online_exp(case: SmallQCase, q_dpas_per_thread: int = 1) 
             os.environ["OV_EXP_USE_WG_SHARED_KV"] = old_shared
 
 
-@pytest.mark.parametrize("q_len", [16])
+@pytest.mark.parametrize("q_len", [6])
 @pytest.mark.parametrize("cmpr", [1])
-@pytest.mark.parametrize("tile_q", [16])
-@pytest.mark.parametrize("q_dpas_per_thread", [1, 2])
-def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int, tile_q: int, q_dpas_per_thread: int):
+# tile_q=6 is the natural fit for q_len=6 but gives Q_ROW_GROUPS=3, which neither divides
+# the 16 KV rows the producer stages nor the 8 marshalling chunks. tile_q=8 wastes 2 of 8
+# q-rows and is slower on the current kernel, yet is much faster once the round 2-4 changes
+# are enabled. See PROFILING.md "Round 5".
+@pytest.mark.parametrize("tile_q", [8])
+def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int, tile_q: int):
     """Profile the experimental pa_small_q_ov_exp kernel at the 6-2-6 point."""
     if os.environ.get("RUN_PA_PERF", "0") != "1":
         pytest.skip("Set RUN_PA_PERF=1 to enable perf test")
@@ -227,8 +229,20 @@ def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int, tile_q: int
         q_len=q_len,
         kv_cache_compression=cmpr,
         tile_q=tile_q,
-        partition_block_num=16,
+        # KV_PARTITION_SIZE = block_size * partition_block_num, which sets how many fp32
+        # partial slices the main kernel writes and the reduce kernel reads back. At 15 k
+        # context those partials are the largest single term in the pair's DRAM traffic
+        # (16.0 MB of 46.5 MB at pb=16). Paired A/B on *total* time at 192 GRF, 10 rounds:
+        #   pb=32   8.1 MB partials, reduce 0.111 ms   baseline
+        #   pb=64   4.2 MB partials, reduce 0.040 ms   main +1.7 %, total -4.3 % (10/10 rounds)
+        #   pb=128  2.1 MB partials, reduce 0.029 ms   main +5.8 %, total -1.7 %
+        # pb=64 is best here, but the trade is shape-dependent -- larger partitions mean
+        # fewer workgroups, so a production host should scale this with context length
+        # rather than pin it. It also moved with the register file: at 160 GRF pb=64 cost
+        # the main kernel 4-7 %, at 192 only 1.7 %.
+        # Correctness over pb in {8,16,32,64,128}: prof_results/pb_correctness.py.
+        partition_block_num=32,
     )
-    result = _benchmark_small_q_online_exp(case, q_dpas_per_thread=q_dpas_per_thread)
+    result = _benchmark_small_q_online_exp(case)
     result_id = next(_RESULT_COUNTER)
-    print(f"\n[Result #{result_id:02d}] q_dpas_per_thread={q_dpas_per_thread} {result}")
+    print(f"\n[Result #{result_id:02d}] {result}")

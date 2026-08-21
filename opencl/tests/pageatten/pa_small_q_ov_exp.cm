@@ -49,7 +49,6 @@ namespace KERNEL_NAME {
 #define USE_LSC_BLOCK_2D_DESC 1
 #endif
 
-
 #define SystolicDepth 8
 #define RepeatCount 1
 #define VNNI_WIDTH 2
@@ -61,26 +60,213 @@ namespace KERNEL_NAME {
 // q-tokens stack on top so DPAS RepeatCount = Q_ROWS = Q_head_chunk_size * TILE_Q.
 #define Q_ROWS (Q_head_chunk_size * TILE_Q)
 
+// Q-rows a single thread owns. This is also the DPAS RepeatCount it issues, because a
+// thread makes exactly one DPAS pass per head-dim chunk: 8 is the widest the systolic
+// array takes and maximises K/V reuse per thread.
+//
+// It is the load-bearing tuning number in this kernel. It fixes the per-thread live state
+// at Omat (ROWS_PER_THREAD*HEAD_SIZE fp32) + Qmat (same in fp16), which decides the
+// smallest register file that does not spill and, through WG_THREADS below, how much SLM
+// each thread costs. Both directions were measured and both are slower:
+//   * more rows/thread (two DPAS passes) inflates live state, forcing a bigger register
+//     file and so fewer resident threads;
+//   * fewer rows/thread (RepeatCount 4) does fit a 128-GRF file with no spill, but each
+//     thread still reads the *whole* marshalled K/V tile regardless of how many q-rows it
+//     serves, so halving the rows doubles total SLM read traffic to buy +25% threads.
 #if Q_ROWS > 8
     #if (Q_ROWS % 8) != 0
         #error "Q_ROWS > 8 requires Q_ROWS to be divisible by 8"
     #endif
-    #define Q_ROWS_PER_DPAS 8
+    #define ROWS_PER_THREAD 8
 #else
-    #define Q_ROWS_PER_DPAS Q_ROWS
+    #define ROWS_PER_THREAD Q_ROWS
 #endif
 
-#ifndef Q_DPAS_PER_THREAD
-#define Q_DPAS_PER_THREAD 1
-#endif
-#define ROWS_PER_THREAD (Q_ROWS_PER_DPAS * Q_DPAS_PER_THREAD)
-#if (Q_ROWS % ROWS_PER_THREAD) != 0
-    #error "Q_ROWS must be divisible by ROWS_PER_THREAD"
-#endif
-#define Q_ROW_GROUPS (Q_ROWS / ROWS_PER_THREAD)
+// Threads per workgroup, i.e. lws[0]. Must equal the host's wg_threads; the host derives
+// it from the same TILE_Q and Q_head_chunk_size, and a mismatch is silent.
+#define WG_THREADS (Q_ROWS / ROWS_PER_THREAD)
 
+// Marshalling chunk counts, as macros so they are usable in #if conditions.
+#define MARSHAL_CHUNKS_C (HEAD_SIZE / REG_K)
+
+// Number of threads that participate in cooperative marshalling. It defaults to the
+// whole workgroup, but the two counts are independent: marshalling is a fixed
+// MARSHAL_CHUNKS_C of work per tile no matter how many q-rows the WG serves. Spreading
+// it over *fewer* threads gives each one more adjacent chunks, which widens the strided
+// raw read out of the row-major staging buffer (MARSHAL_CPT*REG_K bytes per token row
+// instead of REG_K) — the send-count lever, paid for with idle threads during the
+// marshal phase. At WG_THREADS == MARSHAL_CHUNKS_C == 8 the default gives CPT=1, i.e.
+// 16-byte reads. Widening that by marshalling on fewer threads was measured
+// slower: the lost parallelism costs more than the saved sends.
+#if WG_THREADS > MARSHAL_CHUNKS_C
+// More threads than chunks: extra threads would get MARSHAL_CPT == 0 and marshal nothing
+// while still being counted, so cap at one chunk each.
+#define MARSHAL_TG MARSHAL_CHUNKS_C
+#else
+#define MARSHAL_TG WG_THREADS
+#endif
+#if MARSHAL_TG > WG_THREADS
+    #error "MARSHAL_TG cannot exceed WG_THREADS"
+#endif
+#define MARSHAL_CPT      (MARSHAL_CHUNKS_C / MARSHAL_TG)
+
+// KV blocks folded into one online-softmax step. Raising it halves the number of
+// barrier-separated phases per unit of KV and the number of softmax updates, at the cost of
+// ONLINE_TILE_STEPS x the live rS_tile / P_tile / final_sum_acc state and of the marshalled
+// SLM footprint. Overridable from the build options so it can be A/B'd.
+#ifndef ONLINE_TILE_STEPS
 #define ONLINE_TILE_STEPS 1
+#endif
+
 #define NUM_ONLINE_TILES ((KV_PARTITION_STEP_NUM + ONLINE_TILE_STEPS - 1) / ONLINE_TILE_STEPS)
+
+
+// Ablation probe, see the use sites: reuse head-dim chunk 0 for every chunk in both
+// consume loops. Removes 7/8 of the consume-phase SLM read traffic with an almost
+// unchanged instruction stream. Produces wrong results; measurement only.
+#ifndef PA_EXP_PROBE_SLM_REUSE
+#define PA_EXP_PROBE_SLM_REUSE 0
+#endif
+
+// Ablation probe, see the use site: make the whole K/V working set L1-resident by rotating
+// over 4 physical blocks. Isolates exposed DRAM latency/bandwidth from everything else.
+// Produces wrong results; measurement only.
+#ifndef PA_EXP_PROBE_KV_L1
+#define PA_EXP_PROBE_KV_L1 0
+#endif
+
+// How many online tiles ahead to software-prefetch K/V, via cm_prefetch.
+//
+// Round 14 deleted the raw-staging phase, which was double-buffered -- it loaded tile i+1
+// while tile i computed. The 2D block load that replaced it sits at the top of the tile with
+// the marshal consuming it immediately and a barrier right after, so DRAM latency became
+// fully exposed once per tile. The PA_EXP_PROBE_KV_L1 ablation (K/V forced L1-resident)
+// measures that exposure at -21.9 % of the main kernel, most of which is compulsory bus time
+// for the 31.5 MB of K/V; a distance-1 prefetch recovers over half of it.
+//
+// Paired A/B on the main kernel, 8-10 rounds each: distance 1 = -11.8 % and -11.5 % in two
+// independent batches, distance 2 = -6.5 %, distance 4 = -10.4 %. Distance 1 wins because
+// tile i's marshal, barrier and consume already cover a full DRAM round trip, and going
+// deeper only ages the line in L1. cm_prefetch cannot change results.
+#define KV_PREFETCH_DIST 1
+
+// Fold the dequantize's subtract and multiply into one mad: (v - zp)*scale is
+// v*scale + (-zp*scale), and the second term is a per-token scalar that can be built once
+// per tile from 16-element vectors. Saves one whole element pass over the 256-element K and
+// V tiles -- and element passes, not instruction count, are what this kernel pays for.
+#ifndef PA_EXP_MAD_DEQUANT
+#define PA_EXP_MAD_DEQUANT 0
+#endif
+
+// Do the online-softmax shift per row instead of as one whole-tile expression. The
+// whole-tile form has to *materialise* the per-row max as a broadcast matrix
+// (new_max.replicate<...>) before it can subtract it, which is a third element pass: at
+// exec 32 that is 4 mov + 4 add + 4 mul = 24 cycles for 128 floats. Per row it is 8 mads at
+// exec 16 = 8 cycles. Round 4's MATRIX_SOFTMAX chose the whole-tile form on instruction
+// count, which round 15 showed is the wrong metric.
+#ifndef PA_EXP_ROW_SHIFT
+#define PA_EXP_ROW_SHIFT 0
+#endif
+
+// Head-dim chunks fetched per SLM read in the two consume loops. Chunks are contiguous in
+// slm_Kt/slm_Vt, so a wider read returns N adjacent chunks in one message, each still a
+// contiguous 8-GRF region and therefore still a legal direct DPAS operand. Byte traffic is
+// unchanged; only the message count drops. Separates "SLM bytes" from "SLM messages" as the
+// cost of the consume phase.
+#ifndef PA_EXP_WIDE_SLM_READ
+#define PA_EXP_WIDE_SLM_READ 1
+#endif
+
+// --- Ablation probes. All produce wrong results; measurement only. Each removes one
+// resource while leaving the values it feeds live and data-dependent, so IGC cannot fold
+// away the surrounding work (see the round 7 note on PA_EXP_ABLATE_SCALEZP for why that
+// discipline matters).
+//
+// NO_MARSHAL_ALU: keep the global 2D load and the 512 B SLM write, drop the dequantize and
+// the transpose/VNNI pack in between. Isolates the marshal's ALU from its memory traffic.
+#ifndef PA_EXP_PROBE_NO_MARSHAL_ALU
+#define PA_EXP_PROBE_NO_MARSHAL_ALU 0
+#endif
+// NO_SOFTMAX: keep rS live and P fed from it, drop the row-max tree, the rescale guards and
+// the exponentials.
+#ifndef PA_EXP_PROBE_NO_SOFTMAX
+#define PA_EXP_PROBE_NO_SOFTMAX 0
+#endif
+// NO_BARRIER: drop both barriers per online tile. All work stays; only the workgroup
+// lockstep goes away.
+#ifndef PA_EXP_PROBE_NO_BARRIER
+#define PA_EXP_PROBE_NO_BARRIER 0
+#endif
+
+// Double-buffer the marshalled operands, so one barrier per online tile suffices instead of
+// two. With a single slm_Kt/slm_Vt the loop needs a barrier *before* the marshal (so tile
+// i's writes cannot overtake tile i-1's reads) as well as after it. With two slots, tile i
+// writes slot i&1 while any thread still finishing tile i-1 reads slot (i-1)&1, and a thread
+// cannot reach tile i's marshal until every thread has passed tile i-1's post-marshal
+// barrier -- which is after their tile i-2 consume of slot i&1. So the pre-marshal barrier
+// carries no dependency and can go.
+//
+// The ablation suite puts both barriers at -12.0 % of the main kernel. Cost is 8 -> 16 KiB
+// of SLM per workgroup, which is free here: at 192 GRF residency is 6 workgroups per
+// Xe-core, i.e. 96 KiB of the 128 KiB available.
+#ifndef PA_EXP_DBL_SLM
+#define PA_EXP_DBL_SLM 0
+#endif
+
+// Software-pipeline the marshal against the consume: iteration t marshals tile t while
+// consuming tile t-1, with one barrier at the end. Requires PA_EXP_DBL_SLM (the two are
+// touching different slots by construction) and implies it below.
+//
+// The ablation suite says the marshal's dequantize + transpose chain is worth -13.6 % of the
+// main kernel, yet removing a fifth of its element work measures +1.7 %. All-or-nothing like
+// that is the signature of *chain latency*, not throughput: load -> convert -> convert ->
+// convert -> sub -> mul -> transpose -> SLM write is eight dependent steps, and the barrier
+// straight afterwards means nothing else in the thread can cover them. Interleaving the
+// consume's DPAS work with it gives the scheduler something to fill the chain with.
+//
+// The loop runs NUM_ONLINE_TILES+1 times: t marshals tile t (skipped on the last) and
+// consumes tile t-1 (skipped on the first). Slot t&1 is written while slot (t-1)&1 is read,
+// and slot t&1's previous reader was iteration t-1's consume of tile t-2, which the barrier
+// at the end of t-1 already ordered.
+#ifndef PA_EXP_PIPE_MARSHAL
+#define PA_EXP_PIPE_MARSHAL 0
+#endif
+#if PA_EXP_DBL_SLM || PA_EXP_PIPE_MARSHAL
+#define SLM_SLOTS 2
+#else
+#define SLM_SLOTS 1
+#endif
+
+// Pin the online_tile unroll factor. On a kernel near the GRF ceiling IGC spends any freed
+// register slack on more unrolling, so a change that removes work can silently double the
+// code instead of speeding anything up (see PROFILING.md round 3). 0 = let IGC choose.
+#ifndef PA_EXP_TILE_UNROLL
+#define PA_EXP_TILE_UNROLL 0
+#endif
+
+// Dequantize the whole REG_N x REG_K tile with flat/whole-matrix ops instead of one row at
+// a time. Kept OFF: it does exactly what it claims and is worth nothing, which is the
+// cleanest evidence available for what actually costs on this kernel.
+//
+// It cuts the marshal from 213 to 165 instructions and lifts it from exec 16 to exec 32
+// (int8->half convert movs 104 -> 32, dequant sub/mul 64 -> 32; instCount 7509 -> 7133).
+// Measured over 12 paired rounds against a verified-different build: **+1.0 %**.
+//
+// The ALU is 16 wide, so an exec-32 op costs two pipe cycles. Counted in cycles instead of
+// instructions the flat marshal is 285 vs 221 -- it got *worse*. Contrast the promoted
+// vector scale/zp copy, which deleted 96 exec-**1** instructions and won 4-8 %. The cost
+// model on this kernel is pipe cycles at width 16, so widening an already-vector loop pays
+// nothing; only deleting element-work or exec-1 scalar code does. See PROFILING.md round 15.
+#ifndef PA_EXP_FLAT_DEQUANT
+#define PA_EXP_FLAT_DEQUANT 0
+#endif
+
+// Restore the old per-token scalar scale/zp gather, for re-measuring the vector form.
+#ifndef PA_EXP_SCALAR_SCALEZP
+#define PA_EXP_SCALAR_SCALEZP 0
+#endif
+#define PA_PRAGMA_STR(x) _Pragma(#x)
+#define PA_PRAGMA_UNROLL(n) PA_PRAGMA_STR(unroll n)
 
 #if KV_CACHE_COMPRESSION
     #if KV_CACHE_COMPRESSION == 2
@@ -112,6 +298,26 @@ CM_INLINE void Transpose_8x8(matrix_ref<T1, 8, 8> in, matrix_ref<T2, 8, 8> out) 
         out.row(i * 2 + 1) = temp.template select<4, 1, 2, 4>(4, i);
     }
 }
+
+// Per-row max of a ROWS x N tile as a log-depth tree over the column axis, with every
+// step applied to all ROWS at once. Reducing one row at a time costs ROWS*log2(N)
+// instructions at SIMD N/2, N/4 ... 1 -- mostly below the machine width. This is
+// log2(N) instructions at SIMD ROWS*N/2 ... ROWS.
+template <int ROWS, int N>
+struct MatRowMax {
+    CM_INLINE static vector<float, ROWS> apply(matrix_ref<float, ROWS, N> m) {
+        matrix<float, ROWS, N / 2> h =
+            cm_max<float>(m.template select<ROWS, 1, N / 2, 1>(0, 0),
+                          m.template select<ROWS, 1, N / 2, 1>(0, N / 2));
+        return MatRowMax<ROWS, N / 2>::apply(h.template select<ROWS, 1, N / 2, 1>(0, 0));
+    }
+};
+template <int ROWS>
+struct MatRowMax<ROWS, 1> {
+    CM_INLINE static vector<float, ROWS> apply(matrix_ref<float, ROWS, 1> m) {
+        return m.column(0);
+    }
+};
 
 // selected_q_mapping is packed as i32 triples:
 //   [orig_seq_idx_0, q_start_0, valid_count_0,
@@ -180,17 +386,33 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 
 #if KV_CACHE_COMPRESSION == 1
     if (cm_local_size(0) > 1) {
-        if (local_qg >= Q_ROW_GROUPS) {
+        if (local_qg >= WG_THREADS) {
             return;
         }
 
-        constexpr uint K_SLOT_BYTES = REG_N * HEAD_SIZE * sizeof(uint8_t);
-        constexpr uint V_SLOT_BYTES = REG_K * HEAD_SIZE * sizeof(uint8_t);
-        constexpr uint K_CHUNK_BYTES = 2 * K_SLOT_BYTES;
-        constexpr uint V_CHUNK_BYTES = 2 * V_SLOT_BYTES;
-        cm_slm_init(K_CHUNK_BYTES + V_CHUNK_BYTES);
-        auto slm_K = cm_slm_alloc(K_CHUNK_BYTES);
-        auto slm_V0 = cm_slm_alloc(V_CHUNK_BYTES);
+        // Cooperative marshalling: every thread in the WG consumes the same K/V tile, so
+        // the dequantize + transpose/VNNI-pack is shared work. Stage the DPAS-ready
+        // operands in SLM once per WG instead of recomputing them per thread. The *raw*
+        // int8 bytes never touch SLM: each marshalling thread pulls its own
+        // REG_N x REG_K sub-tile straight from global memory with an LSC 2D block
+        // descriptor, which does the row->column gather the old staging buffer existed for.
+        // See PROFILING.md round 14.
+        //   Kt chunk = matrix<half, REG_K, REG_N>      (transposed, dword-VNNI)
+        //   Vt chunk = matrix<half, REG_K/2, REG_N*2>  (VNNI-interleaved)
+        // Both are REG_K * REG_N halves, so one chunk stride covers either.
+        constexpr uint MARSHAL_CHUNKS = HEAD_SIZE / REG_K;          // == HEAD_SIZE / REG_N
+        constexpr uint MARSHAL_CHUNK_BYTES = REG_K * REG_N * sizeof(half);
+        constexpr uint KT_BYTES = ONLINE_TILE_STEPS * MARSHAL_CHUNKS * MARSHAL_CHUNK_BYTES;
+        constexpr uint VT_BYTES = ONLINE_TILE_STEPS * MARSHAL_CHUNKS * MARSHAL_CHUNK_BYTES;
+        // Move a whole chunk per SLM transfer. This kernel is send-count sensitive here:
+        // 64 / 128 / 256 / 512 B per transfer measured 3.105 / 2.464 / 2.403 / 2.344 ms.
+        constexpr uint MARSHAL_XFER_BYTES = MARSHAL_CHUNK_BYTES;
+        constexpr uint MARSHAL_XFERS = MARSHAL_CHUNK_BYTES / MARSHAL_XFER_BYTES;
+        // Only the marshalled DPAS operands live in SLM: 8 KiB per WG, so residency is set
+        // by the register file (min(GRF limit, 128 KiB / slm_per_wg)), not by SLM.
+        cm_slm_init(SLM_SLOTS * (KT_BYTES + VT_BYTES));
+        auto slm_Kt = cm_slm_alloc(SLM_SLOTS * KT_BYTES);
+        auto slm_Vt = cm_slm_alloc(SLM_SLOTS * VT_BYTES);
 
         const uint subgroup_row_base = local_qg * ROWS_PER_THREAD;
         matrix<half, ROWS_PER_THREAD, HEAD_SIZE> Qmat_group = 0;
@@ -224,6 +446,25 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 Qmat_group.row(row).format<half>());
         }
         #endif
+
+        // Q and O are held *chunk-major*: head-dim chunk `ri` is a contiguous register
+        // region, which is what DPAS needs. A DPAS dst/src0 must be consecutive GRFs and
+        // src2 must be a legal direct region; with the natural row-major
+        // Omat[ROWS_PER_THREAD][HEAD_SIZE] the chunk-ri slice is 8 GRFs at 8-GRF stride, so
+        // IGC copies the accumulator in, DPASes and copies it back out on every iteration
+        // (8 + 8 movs per PV DPAS), and Qmat_group's src2 slice costs another 8 (8 rows at
+        // 256 B stride). Chunk-major plus an unrolled chunk loop -- so `ri` is compile-time
+        // -- makes all three regions direct and deletes 192 movs per online tile, 20 % of
+        // the kernel's dynamic instruction count. See PROFILING.md round 13.
+        //
+        // Repack Q once, out of the tile loop: MARSHAL_CHUNKS*ROWS_PER_THREAD movs here in
+        // exchange for the same number on every one of the NUM_ONLINE_TILES tiles.
+        matrix<half, MARSHAL_CHUNKS_C, ROWS_PER_THREAD * REG_K> Qchunks;
+        #pragma unroll
+        for (int c = 0; c < (int)MARSHAL_CHUNKS_C; c++) {
+            Qchunks[c].format<half, ROWS_PER_THREAD, REG_K>() =
+                Qmat_group.select<ROWS_PER_THREAD, 1, REG_K, 1>(0, c * REG_K);
+        }
 
         if (kv_partition_idx >= seq_kv_partition_num) {
             #pragma unroll
@@ -285,14 +526,47 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         constexpr float log2e_wg = 1.4426950408889634f;
         constexpr float loge2_wg = 0.6931471805599453f;
         vector<float, ROWS_PER_THREAD> final_max = -3e38f;
+        // The denominator is only ever read in the epilogue, so there is no reason to
+        // collapse each tile's exp() block to a scalar inside the loop. Accumulate it
+        // lane-wise and pay the single cross-lane reduction once, at the end: this turns
+        // ROWS_PER_THREAD log-depth cm_sum reductions per online tile into
+        // ROWS_PER_THREAD vector adds. Costs REG_N*ROWS_PER_THREAD*4 = 512 B of GRF.
+        matrix<float, ROWS_PER_THREAD, ONLINE_TILE_STEPS * REG_N> final_sum_acc = 0.0f;
         vector<float, ROWS_PER_THREAD> final_sum = 0.0f;
-        matrix<float, ROWS_PER_THREAD, HEAD_SIZE> Omat = 0;
+        // Omat[ri] holds head-dim chunk ri as ROWS_PER_THREAD*REG_N contiguous floats.
+        matrix<float, HEAD_SIZE / REG_N, ROWS_PER_THREAD * REG_N> Omat = 0;
 
         {
             const uint partition_valid = (leftover_size > 0) ? leftover_size : (uint)KV_PARTITION_SIZE;
 
+            // Column blocks strictly below mask_bound are unmasked for *every* row this
+            // thread owns, so the whole per-row masking block can be skipped for them.
+            // The bound is loop-invariant; only the comparison stays in the tile loop.
+            // Rows past valid_count must always be forced to -inf, so the fast path is
+            // only available to threads that own no such row.
+            const int t_min_thread = (int)(subgroup_row_base / Q_head_chunk_size);
+            const int t_max_thread = (int)((subgroup_row_base + ROWS_PER_THREAD - 1) / Q_head_chunk_size);
+            const int kv_global_start_h = (int)(kv_partition_idx * KV_PARTITION_SIZE);
+            const int mask_from_min = (int)(past_q_lens + q_start + t_min_thread + 1) - kv_global_start_h;
+            int mask_bound_i = mask_from_min < (int)partition_valid ? mask_from_min : (int)partition_valid;
+            if (t_max_thread >= (int)valid_count) {
+                mask_bound_i = 0;
+            }
+            const int mask_bound = mask_bound_i;
+
+            // Lane index constant for the scale/zp masked copy below; hoisted out of the
+            // tile loop.
+            vector<ushort, REG_N> lane_idx;
+            #pragma unroll
+            for (int i = 0; i < REG_N; i++) lane_idx[i] = (ushort)i;
+
             // Precompute per-ki valid span once and reuse across all online tiles.
             vector<uint, KV_PARTITION_STEP_NUM> kv_pos_end_cache = 0;
+            // Same for the physical block index. Same number of loads as reading it once per
+            // tile, but they all issue here, in the prologue, where their latency overlaps
+            // instead of sitting on every tile's critical path -- and it makes tile i+1's
+            // prefetch address available with no load at all.
+            vector<uint, KV_PARTITION_STEP_NUM> blk_idx_cache = 0;
             #pragma unroll
             for (int ki = 0; ki < KV_PARTITION_STEP_NUM; ki++) {
                 uint kv_pos_end_in_block = 0;
@@ -305,127 +579,307 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             kv_pos_end_in_block = KV_BLOCK_SIZE;
                         }
                     }
+                    blk_idx_cache[ki] = block_indices[start_block_idx + block_idx];
                 }
                 kv_pos_end_cache[ki] = kv_pos_end_in_block;
             }
 
-            // Prime slot-0 payload so iteration 0 can wait/consume while staging slot-1.
-            if (NUM_ONLINE_TILES > 0) {
-                const int ki0 = 0;
-                const uint slot_k_base = 0;
-                const uint slot_v_base = 0;
 
-                #pragma unroll
-                for (int col = local_qg; col < REG_N; col += Q_ROW_GROUPS) {
-                    vector<uint8_t, HEAD_SIZE> k_row = 0;
-                    if (ki0 < KV_PARTITION_STEP_NUM) {
-                        const uint block_idx = ki0;
-                        if (block_idx < block_num) {
-                            const uint blk_indices = block_indices[start_block_idx + block_idx];
-                            const uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
-                            const uint kv_pos_end_in_block = kv_pos_end_cache[ki0];
-                            if ((uint)col < kv_pos_end_in_block) {
-                                cm_svm_block_read<uint8_t, HEAD_SIZE>(
-                                    (svmptr_t)(key + k_base_offset + col * HEAD_SIZE),
-                                    k_row.format<uint8_t>());
-                            }
-                        }
-                    }
-                    cm_slm_block_write(slm_K, slot_k_base + col * HEAD_SIZE * sizeof(uint8_t), k_row.format<uint8_t>());
-                }
-
-                bool block_valid0 = false;
-                uint v_base_offset0 = 0;
-                uint kv_pos_end_in_block0 = 0;
-                if (ki0 < KV_PARTITION_STEP_NUM) {
-                    const uint block_idx = ki0;
-                    if (block_idx < block_num) {
-                        block_valid0 = true;
-                        const uint blk_indices = block_indices[start_block_idx + block_idx];
-                        v_base_offset0 = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
-                        kv_pos_end_in_block0 = kv_pos_end_cache[ki0];
-                    }
-                }
-                #pragma unroll
-                for (int r = local_qg; r < REG_K; r += Q_ROW_GROUPS) {
-                    vector<uint8_t, HEAD_SIZE> v_row = 0;
-                    if (block_valid0 && (uint)r < kv_pos_end_in_block0) {
-                        cm_svm_block_read<uint8_t, HEAD_SIZE>(
-                            (svmptr_t)(value + v_base_offset0 + r * HEAD_SIZE),
-                            v_row.format<uint8_t>());
-                    }
-                    cm_slm_block_write(slm_V0, slot_v_base + r * HEAD_SIZE * sizeof(uint8_t), v_row.format<uint8_t>());
-                }
-
-                cm_slm_fence(CM_LOCAL_BARRIER);
-                cm_barrier();
-            }
-
+#if PA_EXP_TILE_UNROLL
+            PA_PRAGMA_UNROLL(PA_EXP_TILE_UNROLL)
+#else
             #pragma unroll
+#endif
+#if PA_EXP_PIPE_MARSHAL
+            for (int online_tile = 0; online_tile < NUM_ONLINE_TILES + 1; online_tile++) {
+#else
             for (int online_tile = 0; online_tile < NUM_ONLINE_TILES; online_tile++) {
+#endif
+#if PA_EXP_PIPE_MARSHAL
+                const int m_tile   = online_tile;                  // marshalled this pass
+                const int c_tile   = online_tile - 1;              // consumed this pass
+                const int ki_base_m = m_tile * ONLINE_TILE_STEPS;
+                const int ki_base   = c_tile * ONLINE_TILE_STEPS;
+                const uint slm_slot_k_m = (uint)(m_tile & 1) * KT_BYTES;
+                const uint slm_slot_v_m = (uint)(m_tile & 1) * VT_BYTES;
+                const uint slm_slot_k   = (uint)(c_tile & 1) * KT_BYTES;
+                const uint slm_slot_v   = (uint)(c_tile & 1) * VT_BYTES;
+#else
                 const int ki_base = online_tile * ONLINE_TILE_STEPS;
-                const int slot = online_tile & 1;
-                const uint slot_k_base = slot * K_SLOT_BYTES;
-                const uint slot_v_base = slot * V_SLOT_BYTES;
+                const int ki_base_m = ki_base;
+#endif
+#if !PA_EXP_PIPE_MARSHAL
+#if PA_EXP_DBL_SLM
+                const uint slm_slot_k = (uint)(online_tile & 1) * KT_BYTES;
+                const uint slm_slot_v = (uint)(online_tile & 1) * VT_BYTES;
+#else
+                const uint slm_slot_k = 0;
+                const uint slm_slot_v = 0;
+#endif
+                const uint slm_slot_k_m = slm_slot_k;
+                const uint slm_slot_v_m = slm_slot_v;
+#endif
 
                 matrix<float, ROWS_PER_THREAD, ONLINE_TILE_STEPS * REG_N> rS_tile = 0;
                 matrix<half, ROWS_PER_THREAD, ONLINE_TILE_STEPS * REG_N> P_tile = 0;
 
+#if !PA_EXP_PROBE_NO_BARRIER && !PA_EXP_DBL_SLM
+                // Pre-marshal barrier: with a single set of marshalled buffers this tile's
+                // writes must not overtake the previous tile's reads. Unnecessary once the
+                // buffers are double-buffered -- see PA_EXP_DBL_SLM.
                 cm_fence(CM_LOCAL_BARRIER);
                 cm_barrier();
+#endif
 
-                const int next_tile = online_tile + 1;
-                if (next_tile < NUM_ONLINE_TILES) {
-                    const int next_slot = next_tile & 1;
-                    const uint next_slot_k_base = next_slot * K_SLOT_BYTES;
-                    const uint next_slot_v_base = next_slot * V_SLOT_BYTES;
-                    const int ki_next = next_tile * ONLINE_TILE_STEPS;
 
-                    #pragma unroll
-                    for (int col = local_qg; col < REG_N; col += Q_ROW_GROUPS) {
-                        vector<uint8_t, HEAD_SIZE> k_row = 0;
-                        if (ki_next < KV_PARTITION_STEP_NUM) {
-                            const uint block_idx = ki_next;
-                            if (block_idx < block_num) {
-                                const uint blk_indices = block_indices[start_block_idx + block_idx];
-                                const uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
-                                const uint kv_pos_end_in_block = kv_pos_end_cache[ki_next];
-                                if ((uint)col < kv_pos_end_in_block) {
-                                    cm_svm_block_read<uint8_t, HEAD_SIZE>(
-                                        (svmptr_t)(key + k_base_offset + col * HEAD_SIZE),
-                                        k_row.format<uint8_t>());
-                                }
+                // ---- Cooperative marshalling ------------------------------------------
+                // All threads in the workgroup consume the same K/V tile, so dequantize +
+                // transpose/VNNI-pack it once per WG rather than once per thread. Work is
+                // split by chunk (not by token row) because both the dword-transpose and
+                // the VNNI interleave mix adjacent token rows.
+                //
+                // Only the first MARSHAL_TG threads marshal; the rest fall straight through
+                // to the barrier below. The barrier itself stays outside this guard so the
+                // whole workgroup still meets at it.
+                if (local_qg < MARSHAL_TG
+#if PA_EXP_PIPE_MARSHAL
+                    && m_tile < NUM_ONLINE_TILES
+#endif
+                   ) {
+                #pragma unroll
+                for (int li_m = 0; li_m < ONLINE_TILE_STEPS; li_m++) {
+                    const int ki_m = ki_base_m + li_m;
+                    if (ki_m >= KV_PARTITION_STEP_NUM) {
+                        continue;
+                    }
+
+                    vector<half, REG_N> k_scale = 0.0f;
+                    vector<half, REG_N> k_zp = 0.0f;
+                    vector<half, REG_K> v_scale = 0.0f;
+                    vector<half, REG_K> v_zp = 0.0f;
+#if PA_EXP_MAD_DEQUANT
+                    vector<half, REG_N> k_nzs = 0.0f;   // -zp*scale, folded dequant offset
+                    vector<half, REG_K> v_nzs = 0.0f;
+#endif
+                    // Needed by the 2D descriptors in the chunk loops below. When the block
+                    // is out of range these stay 0 and the load reads block 0 -- harmless,
+                    // because k_scale/k_zp are 0 for those tokens so the dequantized value
+                    // is 0 regardless, and the columns are masked to -inf anyway.
+                    uint k_blk_base = 0;
+                    uint v_blk_base = 0;
+                    // Next tile's bases, for the prefetches in the chunk loops. Out of range
+                    // leaves them 0, which prefetches block 0 -- a prefetch to any mapped
+                    // address is harmless, so no guard is needed.
+                    uint k_blk_next = 0;
+                    uint v_blk_next = 0;
+                    if (ki_m + KV_PREFETCH_DIST < KV_PARTITION_STEP_NUM
+                        && (uint)(ki_m + KV_PREFETCH_DIST) < block_num) {
+                        const uint bn = blk_idx_cache[ki_m + KV_PREFETCH_DIST];
+                        k_blk_next = bn * per_k_block_element_num
+                                   + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
+                        v_blk_next = bn * per_v_block_element_num
+                                   + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
+                    }
+                    if ((uint)ki_m < block_num) {
+                        const uint kv_pos_end_in_block = kv_pos_end_cache[ki_m];
+#if PA_EXP_PROBE_KV_L1
+                        // ABLATION, numerically wrong on purpose: rotate over 4 physical KV
+                        // blocks so the whole working set is L1-resident. Every send, address
+                        // computation and dependency is preserved -- only the DRAM latency
+                        // and bandwidth are removed. The index still varies per tile so the
+                        // loads cannot be CSE'd or hoisted out of the loop.
+                        const uint blk_indices = (start_block_idx + (uint)ki_m) & 3u;
+#else
+                        const uint blk_indices = blk_idx_cache[ki_m];
+#endif
+                        const uint k_base_offset = blk_indices * per_k_block_element_num
+                                                 + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
+                        k_blk_base = k_base_offset;
+                        vector<uint, KV_BLOCK_SIZE> k_scale_zp_block;
+                        cm_svm_block_read<uint, KV_BLOCK_SIZE>(
+                            (svmptr_t)(key + k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE), k_scale_zp_block);
+                        auto k_scale_zp_half = k_scale_zp_block.format<half>();
+
+                        const uint v_base_offset = blk_indices * per_v_block_element_num
+                                                 + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
+                        v_blk_base = v_base_offset;
+                        vector<uint, KV_BLOCK_SIZE> v_scale_zp_block;
+                        cm_svm_block_read<uint, KV_BLOCK_SIZE>(
+                            (svmptr_t)(value + v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE), v_scale_zp_block);
+                        auto v_scale_zp_half = v_scale_zp_block.format<half>();
+
+#if PA_EXP_SCALAR_SCALEZP
+                        #pragma unroll
+                        for (int i = 0; i < REG_N; i++) {
+                            if ((uint)i < kv_pos_end_in_block) {
+                                k_scale[i] = k_scale_zp_half[i];
+                                k_zp[i]    = k_scale_zp_half[KV_BLOCK_SIZE + i];
+                                v_scale[i] = v_scale_zp_half[i];
+                                v_zp[i]    = v_scale_zp_half[KV_BLOCK_SIZE + i];
                             }
                         }
-                        cm_slm_block_write(slm_K, next_slot_k_base + col * HEAD_SIZE * sizeof(uint8_t), k_row.format<uint8_t>());
+#else
+                        // Vector-masked copy. The per-token loop above is semantically
+                        // identical but IGC unrolls it into REG_N predicated *scalar*
+                        // blocks -- 6 exec-1 instructions and a branch each, 109
+                        // instructions and 17 branches per online tile (19 % of the tile's
+                        // executed instructions) to move 64 halves already contiguous.
+                        vector<ushort, REG_N> lane_valid =
+                            lane_idx < (ushort)kv_pos_end_in_block;
+                        k_scale.merge(k_scale_zp_half.select<REG_N, 1>(0), lane_valid);
+                        k_zp.merge(k_scale_zp_half.select<REG_N, 1>(KV_BLOCK_SIZE), lane_valid);
+                        v_scale.merge(v_scale_zp_half.select<REG_N, 1>(0), lane_valid);
+                        v_zp.merge(v_scale_zp_half.select<REG_N, 1>(KV_BLOCK_SIZE), lane_valid);
+#endif
+#if PA_EXP_MAD_DEQUANT
+                        // Two 16-element ops per tile, to save an element pass over the two
+                        // 256-element tiles below.
+                        k_nzs = cm_mul<half>(-k_zp, k_scale);
+                        v_nzs = cm_mul<half>(-v_zp, v_scale);
+#endif
                     }
 
-                    bool block_valid_next = false;
-                    uint v_base_offset_next = 0;
-                    uint kv_pos_end_in_block_next = 0;
-                    if (ki_next < KV_PARTITION_STEP_NUM) {
-                        const uint block_idx = ki_next;
-                        if (block_idx < block_num) {
-                            block_valid_next = true;
-                            const uint blk_indices = block_indices[start_block_idx + block_idx];
-                            v_base_offset_next = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
-                            kv_pos_end_in_block_next = kv_pos_end_cache[ki_next];
+                    // K and V marshalled in separate loops so their working sets do not
+                    // have to be live at the same time — this kernel already sits at
+                    // 243/256 GRF, so overlapping them spills.
+                    #pragma nounroll
+                    for (int c = local_qg; c < (int)MARSHAL_CHUNKS; c += MARSHAL_TG) {
+                        const uint chunk_out = (li_m * MARSHAL_CHUNKS + c) * MARSHAL_CHUNK_BYTES;
+
+                        // K: dequantize token rows, then dword-transpose into VNNI layout.
+                        matrix<uint8_t, REG_N, REG_K> Kq;
+                        // REG_N token rows x REG_K bytes of head-dim at pitch HEAD_SIZE --
+                        // the exact sub-tile this thread needs, gathered by the LSC in one
+                        // message instead of REG_N SLM reads of a staged copy.
+                        {
+                            lsc::block_2d_desc<uint8_t, 1, REG_N, REG_K> b2dK(
+                                key + k_blk_base, KV_BLOCK_SIZE - 1,
+                                HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+                            b2dK.set_block_x(c * REG_K);
+                            cm_load<lsc::Normal>(Kq.format<uint8_t>(), b2dK);
                         }
-                    }
-                    #pragma unroll
-                    for (int r = local_qg; r < REG_K; r += Q_ROW_GROUPS) {
-                        vector<uint8_t, HEAD_SIZE> v_row = 0;
-                        if (block_valid_next && (uint)r < kv_pos_end_in_block_next) {
-                            cm_svm_block_read<uint8_t, HEAD_SIZE>(
-                                (svmptr_t)(value + v_base_offset_next + r * HEAD_SIZE),
-                                v_row.format<uint8_t>());
+                        {
+                            lsc::block_2d_desc<uint8_t, 1, REG_N, REG_K> pfK(
+                                key + k_blk_next, KV_BLOCK_SIZE - 1,
+                                HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+                            pfK.set_block_x(c * REG_K);
+                            cm_prefetch(pfK);
                         }
-                        cm_slm_block_write(slm_V0, next_slot_v_base + r * HEAD_SIZE * sizeof(uint8_t), v_row.format<uint8_t>());
+#if PA_EXP_FLAT_DEQUANT
+                        matrix<half, REG_N, REG_K> KtNormal;
+                        // Kq and KtNormal are both flat-contiguous, so this is one cast over
+                        // 256 elements rather than REG_N separate row casts.
+                        KtNormal.format<half>() = Kq.format<uint8_t>();
+                        KtNormal = KtNormal - k_zp.replicate<REG_N, 1, REG_K, 0>();
+                        KtNormal = cm_mul<half>(KtNormal, k_scale.replicate<REG_N, 1, REG_K, 0>());
+#else
+                        matrix<half, REG_N, REG_K> KtNormal = 0;
+#if PA_EXP_PROBE_NO_MARSHAL_ALU
+                        KtNormal.format<uint8_t>().select<REG_N * REG_K, 1>(0) =
+                            Kq.format<uint8_t>();
+#else
+                        #pragma unroll
+                        for (int col = 0; col < REG_N; col++) {
+                            KtNormal.row(col) = Kq.row(col);
+#if PA_EXP_MAD_DEQUANT
+                            KtNormal.row(col) = KtNormal.row(col) * k_scale[col] + k_nzs[col];
+#else
+                            KtNormal.row(col) = KtNormal.row(col) - k_zp[col];
+                            KtNormal.row(col) = cm_mul<half>(KtNormal.row(col), k_scale[col]);
+#endif
+                        }
+#endif
+#endif
+                        matrix<half, REG_K, REG_N> Kt_m = 0;
+#if PA_EXP_PROBE_NO_MARSHAL_ALU
+                        Kt_m.format<half>() = KtNormal.format<half>();
+#else
+                        Transpose_8x8(
+                            KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(0,0),
+                            Kt_m.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
+                        Transpose_8x8(
+                            KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(8,0),
+                            Kt_m.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
+#endif
+                        auto Kt_bytes = Kt_m.format<uint8_t>();
+                        #pragma unroll
+                        for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
+                            cm_slm_block_write(slm_Kt, slm_slot_k_m + chunk_out + x * MARSHAL_XFER_BYTES,
+                                               Kt_bytes.select<MARSHAL_XFER_BYTES, 1>(x * MARSHAL_XFER_BYTES));
+                        }
                     }
 
-                    cm_slm_fence(CM_LOCAL_BARRIER);
-                    cm_barrier();
+                    #pragma nounroll
+                    for (int c = local_qg; c < (int)MARSHAL_CHUNKS; c += MARSHAL_TG) {
+                        const uint chunk_out = (li_m * MARSHAL_CHUNKS + c) * MARSHAL_CHUNK_BYTES;
+
+                        // V: dequantize token rows, then VNNI-interleave row pairs.
+                        matrix<uint8_t, REG_K, REG_N> Vq;
+                        {
+                            lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(
+                                value + v_blk_base, KV_BLOCK_SIZE - 1,
+                                HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+                            b2dV.set_block_x(c * REG_N);
+                            cm_load<lsc::Normal>(Vq.format<uint8_t>(), b2dV);
+                        }
+                        {
+                            lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> pfV(
+                                value + v_blk_next, KV_BLOCK_SIZE - 1,
+                                HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+                            pfV.set_block_x(c * REG_N);
+                            cm_prefetch(pfV);
+                        }
+#if PA_EXP_FLAT_DEQUANT
+                        matrix<half, REG_K, REG_N> VmatNormal;
+                        VmatNormal.format<half>() = Vq.format<uint8_t>();
+                        VmatNormal = VmatNormal - v_zp.replicate<REG_K, 1, REG_N, 0>();
+                        VmatNormal = cm_mul<half>(VmatNormal, v_scale.replicate<REG_K, 1, REG_N, 0>());
+#else
+                        matrix<half, REG_K, REG_N> VmatNormal = 0;
+#if PA_EXP_PROBE_NO_MARSHAL_ALU
+                        VmatNormal.format<uint8_t>().select<REG_K * REG_N, 1>(0) =
+                            Vq.format<uint8_t>();
+#else
+                        #pragma unroll
+                        for (int r = 0; r < REG_K; r++) {
+                            VmatNormal[r] = Vq.row(r);
+#if PA_EXP_MAD_DEQUANT
+                            VmatNormal[r] = VmatNormal[r] * v_scale[r] + v_nzs[r];
+#else
+                            VmatNormal[r] = VmatNormal[r] - v_zp[r];
+                            VmatNormal[r] = cm_mul<half>(VmatNormal[r], v_scale[r]);
+#endif
+                        }
+#endif
+#endif
+                        matrix<half, REG_K/2, REG_N*2> Vmat_m;
+#if PA_EXP_PROBE_NO_MARSHAL_ALU
+                        Vmat_m.format<half>() = VmatNormal.format<half>();
+#else
+                        Vmat_m.select<REG_K/2, 1, REG_N, 2>(0, 0) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(0, 0);
+                        Vmat_m.select<REG_K/2, 1, REG_N, 2>(0, 1) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(1, 0);
+#endif
+                        auto Vt_bytes = Vmat_m.format<uint8_t>();
+                        #pragma unroll
+                        for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
+                            cm_slm_block_write(slm_Vt, slm_slot_v_m + chunk_out + x * MARSHAL_XFER_BYTES,
+                                               Vt_bytes.select<MARSHAL_XFER_BYTES, 1>(x * MARSHAL_XFER_BYTES));
+                        }
+                    }
                 }
+                } /* local_qg < MARSHAL_TG */
+#if PA_EXP_PIPE_MARSHAL
+                // No barrier between marshal and consume: they touch different slots, and
+                // the consume's operands were published by the previous iteration's barrier.
+                // Leaving them adjacent is the whole point -- it gives IGC the consume's DPAS
+                // work to schedule into the marshal's dependency chain.
+                if (c_tile >= 0) {
+#else
+#if !PA_EXP_PROBE_NO_BARRIER
+                cm_slm_fence(CM_LOCAL_BARRIER);
+                cm_barrier();
+#endif
+#endif
 
                 #pragma unroll
                 for (int li = 0; li < ONLINE_TILE_STEPS; li++) {
@@ -433,68 +887,74 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     if (ki >= KV_PARTITION_STEP_NUM) {
                         continue;
                     }
-                    vector<half, REG_N> slm_k_scale = 0.0f;
-                    vector<half, REG_N> slm_k_zp = 0.0f;
-                    {
-                        const uint block_idx = ki;
-                        if (block_idx < block_num) {
-                            const uint blk_indices = block_indices[start_block_idx + block_idx];
-                            const uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
-                            const uint k_scale_zp_offset = k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
-                            vector<uint, KV_BLOCK_SIZE> k_scale_zp_block;
-                            cm_svm_block_read<uint, KV_BLOCK_SIZE>((svmptr_t)(key + k_scale_zp_offset), k_scale_zp_block);
-                            auto k_scale_zp_half = k_scale_zp_block.format<half>();
-                            const uint kv_pos_end_in_block = kv_pos_end_cache[ki];
-                            #pragma unroll
-                            for (int col = 0; col < REG_N; col++) {
-                                if ((uint)col < kv_pos_end_in_block) {
-                                    slm_k_scale[col] = k_scale_zp_half[col];
-                                    slm_k_zp[col] = k_scale_zp_half[KV_BLOCK_SIZE + col];
-                                }
-                            }
+
+                    // Fully unrolled so `ri` is compile-time and the chunk-major Q/O
+                    // register regions above stay direct. Earlier attempts to unroll this
+                    // loop spilled, but that was with the row-major layout, where each
+                    // unrolled copy needed its own gathered Qmat_data temporary; with
+                    // chunk-major there are no temporaries and GRF *drops* (154 -> 148).
+#if PA_EXP_WIDE_SLM_READ > 1
+                    #pragma unroll
+                    for (int rb = 0; rb < (HEAD_SIZE / REG_K) / PA_EXP_WIDE_SLM_READ; rb++) {
+                        matrix<half, PA_EXP_WIDE_SLM_READ * REG_K, REG_N> Ktw;
+                        cm_slm_block_read(slm_Kt, GENX_DWALIGNED,
+                                          slm_slot_k + (li * MARSHAL_CHUNKS + rb * PA_EXP_WIDE_SLM_READ)
+                                              * MARSHAL_CHUNK_BYTES,
+                                          Ktw.format<uint8_t>());
+                        #pragma unroll
+                        for (int w = 0; w < PA_EXP_WIDE_SLM_READ; w++) {
+                            const int ri = rb * PA_EXP_WIDE_SLM_READ + w;
+                            auto Kt = Ktw.select<REG_K, 1, REG_N, 1>(w * REG_K, 0);
+                            auto Qmat_data = Qchunks[ri].format<half, ROWS_PER_THREAD, REG_K>();
+                            auto rS_acc = rS_tile.select<ROWS_PER_THREAD, 1, REG_N, 1>(0, li * REG_N);
+                            rS_acc = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth,
+                                             ROWS_PER_THREAD>(
+                                        rS_acc.format<float>(), Kt.format<int32_t>(),
+                                        Qmat_data.format<int32_t>());
                         }
                     }
-
-                    for (int k = 0, ri = 0; k < HEAD_SIZE / REG_K; k += 1, ri++) {
-                        matrix<uint8_t, REG_N, REG_K> Krows_quant_chunk;
-                        #pragma unroll
-                        for (int col = 0; col < REG_N; col++) {
-                            const uint k_chunk_offset = slot_k_base + ((li * REG_N + col) * HEAD_SIZE + ri * REG_K) * sizeof(uint8_t);
-                            cm_slm_block_read(slm_K, GENX_DWALIGNED, k_chunk_offset, Krows_quant_chunk.row(col).format<uint8_t>());
-                        }
-                        matrix<half, REG_K, REG_N> Kt = 0;
-                        matrix<half, REG_N, REG_K> KtNormal = 0;
-                        #pragma unroll
-                        for (int col = 0; col < REG_N; col++) {
-                            KtNormal.row(col) = Krows_quant_chunk.row(col);
-                            KtNormal.row(col) = KtNormal.row(col) - slm_k_zp[col];
-                            KtNormal.row(col) = cm_mul<half>(KtNormal.row(col), slm_k_scale[col]);
-                        }
-#if XE_ARCH==1
-                        Transpose_8x8(KtNormal.format<uint, REG_N, REG_K/2>(), Kt.format<uint, REG_K/2, REG_N>());
-#else
-                        Transpose_8x8(
-                            KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(0,0),
-                            Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
-                        Transpose_8x8(
-                            KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(8,0),
-                            Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
+                    if (false)
 #endif
-                        #pragma unroll
-                        for (int pass = 0; pass < Q_DPAS_PER_THREAD; pass++) {
-                            matrix<half, Q_ROWS_PER_DPAS, REG_K> Qmat_data = Qmat_group.select<Q_ROWS_PER_DPAS,1,REG_K,1>(pass * Q_ROWS_PER_DPAS, ri * REG_K);
-                            matrix<float, Q_ROWS_PER_DPAS, REG_N> rS_data = 0;
-                            rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS_PER_DPAS>(
-                                        rS_data.format<float>(),
-                                        Kt.format<int32_t>(),
-                                        Qmat_data.format<int32_t>());
-                            rS_tile.select<Q_ROWS_PER_DPAS, 1, REG_N, 1>(pass * Q_ROWS_PER_DPAS, li * REG_N) += rS_data;
+                    #pragma unroll
+                    for (int k = 0, ri = 0; k < HEAD_SIZE / REG_K; k += 1, ri++) {
+                        // Already dequantized, transposed and VNNI-packed by the marshalling
+                        // stage — read the DPAS operand straight out of SLM.
+                        matrix<half, REG_K, REG_N> Kt;
+                        {
+                            auto Kt_in = Kt.format<uint8_t>();
+#if PA_EXP_PROBE_SLM_REUSE
+                            // ABLATION, numerically wrong on purpose: every head-dim chunk
+                            // reads chunk 0, so 7/8 of the consume-phase SLM read traffic
+                            // disappears while Kt stays live and data-dependent. Isolates
+                            // "is consume SLM read the limiter" from instruction count.
+                            const uint chunk_in = (li * MARSHAL_CHUNKS) * MARSHAL_CHUNK_BYTES;
+#else
+                            const uint chunk_in = (li * MARSHAL_CHUNKS + ri) * MARSHAL_CHUNK_BYTES;
+#endif
+                            #pragma unroll
+                            for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
+                                cm_slm_block_read(slm_Kt, GENX_DWALIGNED,
+                                                  slm_slot_k + chunk_in + x * MARSHAL_XFER_BYTES,
+                                                  Kt_in.select<MARSHAL_XFER_BYTES, 1>(x * MARSHAL_XFER_BYTES));
+                            }
                         }
+                        auto Qmat_data = Qchunks[ri].format<half, ROWS_PER_THREAD, REG_K>();
+                        // Accumulate straight into rS_tile, the way the PV loop below
+                        // already accumulates into Omat. Zeroing a temporary, DPAS'ing into
+                        // it and adding it in costs an extra zero-init and accumulate pass
+                        // per head-dim chunk, and breaks the systolic accumulator chain
+                        // that lets back-to-back dpas issue at full rate.
+                        auto rS_acc = rS_tile.select<ROWS_PER_THREAD, 1, REG_N, 1>(0, li * REG_N);
+                        rS_acc = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, ROWS_PER_THREAD>(
+                                    rS_acc.format<float>(),
+                                    Kt.format<int32_t>(),
+                                    Qmat_data.format<int32_t>());
                     }
                 }
 
                 rS_tile = cm_mul<float>(rS_tile, (float)SCALE_FACTOR);
 
+                if ((ki_base + ONLINE_TILE_STEPS) * REG_N > mask_bound)
                 {
                     const int kv_global_start = (int)(kv_partition_idx * KV_PARTITION_SIZE);
                     vector<int, REG_N> col_index;
@@ -532,26 +992,60 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     }
                 }
 
-                #pragma unroll
-                for (int row = 0; row < ROWS_PER_THREAD; row++) {
-                    auto rS_row = rS_tile[row].format<float>();
-#if XE_ARCH==1
-                    float tile_max = cm_reduced_max<float>(rS_row);
+                // Whole-tile online softmax. Every step below -- the max tree, the shift,
+                // the exp, the denominator accumulate and the fp16 pack -- runs over the
+                // full ROWS_PER_THREAD x REG_N tile, so each is a handful of full-width
+                // instructions instead of ROWS_PER_THREAD narrow ones. Only the
+                // accumulator rescale stays per-row, because whether it is needed is
+                // data-dependent per row.
+                {
+                    constexpr int SM_N = ONLINE_TILE_STEPS * REG_N;
+#if PA_EXP_PROBE_NO_SOFTMAX
+                    // ABLATION: drop the row-max tree, the per-row rescale guards and the
+                    // exponentials. rS stays live and still feeds P and the denominator, so
+                    // nothing upstream folds away.
+                    P_tile.format<half>() = rS_tile.format<float>();
+                    final_sum_acc.format<float>() += rS_tile.format<float>();
 #else
-                    float tile_max = rS_row[0];
-                    #pragma unroll
-                    for (int r = 1; r < rS_row.n_elems(); r++)
-                        tile_max = cm_max<float>(tile_max, rS_row[r]);
-#endif
-                    float new_max = cm_max<float>(final_max[row], tile_max);
-                    float correction = cm_exp((final_max[row] - new_max) * log2e_wg);
-                    final_sum[row] *= correction;
-                    Omat.row(row) *= correction;
+                    vector<float, ROWS_PER_THREAD> tile_max =
+                        MatRowMax<ROWS_PER_THREAD, SM_N>::apply(
+                            rS_tile.select<ROWS_PER_THREAD, 1, SM_N, 1>(0, 0));
+                    vector<float, ROWS_PER_THREAD> new_max = cm_max<float>(final_max, tile_max);
 
-                    vector<float, ONLINE_TILE_STEPS * REG_N> exp_vals = cm_exp((rS_row - new_max) * log2e_wg);
-                    final_sum[row] += cm_sum<float>(exp_vals);
-                    final_max[row] = new_max;
-                    P_tile[row] = exp_vals;
+                    #pragma unroll
+                    for (int row = 0; row < ROWS_PER_THREAD; row++) {
+                        if (tile_max[row] > final_max[row])
+                        {
+                            float correction = cm_exp((final_max[row] - new_max[row]) * log2e_wg);
+                            final_sum_acc.row(row) *= correction;
+                            // Row `row` lives at offset row*REG_N of every chunk.
+                            Omat.select<HEAD_SIZE / REG_N, 1, REG_N, 1>(0, row * REG_N) *= correction;
+                        }
+                    }
+                    final_max = new_max;
+
+#if PA_EXP_ROW_SHIFT
+                    // exp2((rS - m) * log2e) == exp2(rS*log2e - m*log2e): scale the row max
+                    // once (8 elements) so each row becomes a single mad against a scalar,
+                    // with no broadcast matrix to materialise.
+                    vector<float, ROWS_PER_THREAD> nm_l2 = cm_mul<float>(new_max, log2e_wg);
+                    matrix<float, ROWS_PER_THREAD, SM_N> shifted_m;
+                    #pragma unroll
+                    for (int row = 0; row < ROWS_PER_THREAD; row++) {
+                        shifted_m.row(row) =
+                            rS_tile.row(row) * log2e_wg - nm_l2[row];
+                    }
+                    vector<float, ROWS_PER_THREAD * SM_N> exp_all =
+                        cm_exp(shifted_m.format<float>());
+#else
+                    vector<float, ROWS_PER_THREAD * SM_N> shifted =
+                        (rS_tile.format<float>()
+                         - new_max.replicate<ROWS_PER_THREAD, 1, SM_N, 0>()) * log2e_wg;
+                    vector<float, ROWS_PER_THREAD * SM_N> exp_all = cm_exp(shifted);
+#endif
+                    final_sum_acc.format<float>() += exp_all;
+                    P_tile.format<half>() = exp_all;
+#endif
                 }
 
                 #pragma unroll
@@ -572,60 +1066,82 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         kv_pos_end_in_block = kv_pos_end_cache[ki];
                     }
 
-                    vector<half, REG_K> slm_v_scale = 0.0f;
-                    vector<half, REG_K> slm_v_zp = 0.0f;
-                    if (block_valid) {
-                        const uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
-                        vector<uint, KV_BLOCK_SIZE> v_scale_zp_block;
-                        cm_svm_block_read<uint, KV_BLOCK_SIZE>((svmptr_t)(value + v_scale_zp_offset), v_scale_zp_block);
-                        auto v_scale_zp_half = v_scale_zp_block.format<half>();
+#if PA_EXP_WIDE_SLM_READ > 1
+                    #pragma unroll
+                    for (int rb = 0; rb < (HEAD_SIZE / REG_N) / PA_EXP_WIDE_SLM_READ; rb++) {
+                        matrix<half, PA_EXP_WIDE_SLM_READ * REG_K / 2, REG_N * 2> Vtw;
+                        cm_slm_block_read(slm_Vt, GENX_DWALIGNED,
+                                          slm_slot_v + (li_v * MARSHAL_CHUNKS + rb * PA_EXP_WIDE_SLM_READ)
+                                              * MARSHAL_CHUNK_BYTES,
+                                          Vtw.format<uint8_t>());
                         #pragma unroll
-                        for (int r = 0; r < REG_K; r++) {
-                            if ((uint)r < kv_pos_end_in_block) {
-                                slm_v_scale[r] = v_scale_zp_half[r];
-                                slm_v_zp[r] = v_scale_zp_half[KV_BLOCK_SIZE + r];
-                            }
-                        }
-                    }
-
-                    for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
-                        matrix<uint8_t, REG_K, REG_N> Vrows_quant_chunk;
-                        #pragma unroll
-                        for (int r = 0; r < REG_K; r++) {
-                            const uint v_chunk_offset = slot_v_base + (r * HEAD_SIZE + k) * sizeof(uint8_t);
-                            cm_slm_block_read(slm_V0, GENX_DWALIGNED, v_chunk_offset, Vrows_quant_chunk.row(r).format<uint8_t>());
-                        }
-                        matrix<half, REG_K, REG_N> VmatNormal;
-                        #pragma unroll
-                        for (int r = 0; r < REG_K; r++) {
-                            const int kv_row = r;
-                            VmatNormal[r] = Vrows_quant_chunk.row(r);
-                            VmatNormal[r] = VmatNormal[r] - slm_v_zp[kv_row];
-                            VmatNormal[r] = cm_mul<half>(VmatNormal[r], slm_v_scale[kv_row]);
-                        }
-                        matrix<half, REG_K/2, REG_N*2> Vmat;
-                        auto Vref = Vmat.format<half, REG_K/2, REG_N*2>();
-                        Vref.select<REG_K/2, 1, REG_N, 2>(0, 0) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(0, 0);
-                        Vref.select<REG_K/2, 1, REG_N, 2>(0, 1) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(1, 0);
-
-                        #pragma unroll
-                        for (int pass = 0; pass < Q_DPAS_PER_THREAD; pass++) {
-                            matrix<half, Q_ROWS_PER_DPAS, REG_K> Pmat_data =
-                                P_tile.select<Q_ROWS_PER_DPAS, 1, REG_K, 1>(pass * Q_ROWS_PER_DPAS, li_v * REG_N);
-                            auto Omat_data = Omat.select<Q_ROWS_PER_DPAS,1,REG_N,1>(pass * Q_ROWS_PER_DPAS, ri * REG_N);
-                            Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS_PER_DPAS>(
-                                        Omat_data.format<float>(),
-                                        Vmat.format<int32_t>(),
+                        for (int w = 0; w < PA_EXP_WIDE_SLM_READ; w++) {
+                            const int ri = rb * PA_EXP_WIDE_SLM_READ + w;
+                            auto Vmat = Vtw.select<REG_K / 2, 1, REG_N * 2, 1>(w * REG_K / 2, 0);
+                            matrix<half, ROWS_PER_THREAD, REG_K> Pmat_data =
+                                P_tile.select<ROWS_PER_THREAD, 1, REG_K, 1>(0, li_v * REG_N);
+                            auto Omat_data = Omat[ri].format<float, ROWS_PER_THREAD, REG_N>();
+                            Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth,
+                                                ROWS_PER_THREAD>(
+                                        Omat_data.format<float>(), Vmat.format<int32_t>(),
                                         Pmat_data.format<int32_t>());
                         }
                     }
+                    if (false)
+#endif
+                    #pragma unroll
+                    for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
+                        matrix<half, REG_K/2, REG_N*2> Vmat;
+                        {
+                            auto Vt_in = Vmat.format<uint8_t>();
+#if PA_EXP_PROBE_SLM_REUSE
+                            const uint chunk_in = (li_v * MARSHAL_CHUNKS) * MARSHAL_CHUNK_BYTES;
+#else
+                            const uint chunk_in = (li_v * MARSHAL_CHUNKS + ri) * MARSHAL_CHUNK_BYTES;
+#endif
+                            #pragma unroll
+                            for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
+                                cm_slm_block_read(slm_Vt, GENX_DWALIGNED,
+                                                  slm_slot_v + chunk_in + x * MARSHAL_XFER_BYTES,
+                                                  Vt_in.select<MARSHAL_XFER_BYTES, 1>(x * MARSHAL_XFER_BYTES));
+                            }
+                        }
+
+                        matrix<half, ROWS_PER_THREAD, REG_K> Pmat_data =
+                            P_tile.select<ROWS_PER_THREAD, 1, REG_K, 1>(0, li_v * REG_N);
+                        auto Omat_data = Omat[ri].format<float, ROWS_PER_THREAD, REG_N>();
+                        Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, ROWS_PER_THREAD>(
+                                    Omat_data.format<float>(),
+                                    Vmat.format<int32_t>(),
+                                    Pmat_data.format<int32_t>());
+                    }
                 }
 
-                // 2-slot ring safety: all threads must finish consuming current slot
-                // before any thread starts the next iteration and reuses that slot.
-                cm_fence(CM_LOCAL_BARRIER);
+#if PA_EXP_PIPE_MARSHAL
+                } /* c_tile >= 0 */
+                // The single barrier of the pipelined form. It publishes this iteration's
+                // marshal of tile t to every thread before iteration t+1 consumes it, and it
+                // orders this iteration's consume of tile t-1 ahead of iteration t+1's
+                // marshal into that same slot.
+#if !PA_EXP_PROBE_NO_BARRIER
+                cm_slm_fence(CM_LOCAL_BARRIER);
                 cm_barrier();
+#endif
+#else
+                // No barrier here. All threads must finish consuming slm_Kt / slm_Vt before
+                // the next iteration's marshal overwrites them, but the barrier at the top
+                // of the loop body already guarantees exactly that, and with the raw-staging
+                // block gone the two used to sit back to back with nothing in between. Two
+                // 10-12 round A/Bs put the removal at -3.6 % and -1.1 %; call it ~2 %, which
+                // is at this rig's resolution limit, but it never measured positive and it
+                // deletes a synchronisation point that provably separated nothing.
+#endif
             }
+        }
+
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_THREAD; row++) {
+            final_sum[row] = cm_sum<float>(final_sum_acc.row(row));
         }
 
         vector<float, ROWS_PER_THREAD> cur_lse;
@@ -648,15 +1164,15 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                           + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE
                           + kv_partition_idx * HEAD_SIZE;
             float div_cur_sum = (row_valid && final_sum[row] > 0.0f) ? (1.0f / final_sum[row]) : 0.0f;
-            auto Omat_slice = Omat[row].format<float, HEAD_SIZE/REG_N * REG_M, REG_N>();
             #pragma unroll
             for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
-                auto cO = Omat_slice[ri].format<float, REG_M, REG_N>();
-#if XE_ARCH==1
+                auto cO = Omat.select<1, 1, REG_N, 1>(ri, row * REG_N)
+                              .format<float, REG_M, REG_N>();
+                // Multiply by the reciprocal computed above instead of issuing a full
+                // IEEE divide per register block. cm_div_ieee expands to invm + 7*madm,
+                // and the row_valid predicate puts each expansion in its own basic block,
+                // so the 128 chains per thread cannot pipeline. See PROFILING.md.
                 cur_O_f32 = row_valid && final_sum[row] > 0.0f ? cm_mul<float>(cO, div_cur_sum) : 0.0f;
-#else
-                cur_O_f32 = row_valid && final_sum[row] > 0.0f ? cm_div_ieee(cO, final_sum[row]) : 0.0f;
-#endif
                 cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), cur_O_f32.format<float>());
             }
             uint lse_offset = token_row * HEADS_NUM * kv_partition_num
