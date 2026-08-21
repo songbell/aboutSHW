@@ -208,14 +208,13 @@ def _benchmark_small_q_online_exp(case: SmallQCase) -> PerfResult:
             os.environ["OV_EXP_USE_WG_SHARED_KV"] = old_shared
 
 
-@pytest.mark.parametrize("q_len", [6])
-@pytest.mark.parametrize("cmpr", [1])
+@pytest.mark.parametrize("q_len", [6, 16])
+@pytest.mark.parametrize("cmpr", [1, 2])
 # tile_q=6 is the natural fit for q_len=6 but gives Q_ROW_GROUPS=3, which neither divides
 # the 16 KV rows the producer stages nor the 8 marshalling chunks. tile_q=8 wastes 2 of 8
 # q-rows and is slower on the current kernel, yet is much faster once the round 2-4 changes
 # are enabled. See PROFILING.md "Round 5".
-@pytest.mark.parametrize("tile_q", [8])
-def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int, tile_q: int):
+def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int):
     """Profile the experimental pa_small_q_ov_exp kernel at the 6-2-6 point."""
     if os.environ.get("RUN_PA_PERF", "0") != "1":
         pytest.skip("Set RUN_PA_PERF=1 to enable perf test")
@@ -228,7 +227,7 @@ def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int, tile_q: int
         past_len=PAST_LEN_15K,
         q_len=q_len,
         kv_cache_compression=cmpr,
-        tile_q=tile_q,
+        tile_q=q_len,
         # KV_PARTITION_SIZE = block_size * partition_block_num, which sets how many fp32
         # partial slices the main kernel writes and the reduce kernel reads back. At 15 k
         # context those partials are the largest single term in the pair's DRAM traffic

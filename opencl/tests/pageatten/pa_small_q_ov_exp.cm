@@ -384,7 +384,14 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * HEAD_SIZE;
 #endif
 
-#if KV_CACHE_COMPRESSION == 1
+// The workgroup-shared path covers both quantised layouts. compr=1 quantises K per *token*
+// (one scale/zp per token row, shared by all HEAD_SIZE channels); compr=2 quantises it per
+// *channel* (one scale/zp per channel, shared by the SUB_BLOCK_SIZE tokens of a group).
+// The K *data* layout is identical in both -- token-major, HEAD_SIZE bytes per token,
+// pitch HEAD_SIZE -- so the 2D block load, the transpose, the SLM sharing and everything
+// downstream are unchanged. Only where the scale/zp vector comes from, and which axis it
+// broadcasts along, differ. V is per-token in both.
+#if KV_CACHE_COMPRESSION >= 1
     if (cm_local_size(0) > 1) {
         if (local_qg >= WG_THREADS) {
             return;
@@ -695,10 +702,12 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         const uint k_base_offset = blk_indices * per_k_block_element_num
                                                  + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
                         k_blk_base = k_base_offset;
+#if KV_CACHE_COMPRESSION == 1
                         vector<uint, KV_BLOCK_SIZE> k_scale_zp_block;
                         cm_svm_block_read<uint, KV_BLOCK_SIZE>(
                             (svmptr_t)(key + k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE), k_scale_zp_block);
                         auto k_scale_zp_half = k_scale_zp_block.format<half>();
+#endif
 
                         const uint v_base_offset = blk_indices * per_v_block_element_num
                                                  + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
@@ -724,17 +733,30 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         // blocks -- 6 exec-1 instructions and a branch each, 109
                         // instructions and 17 branches per online tile (19 % of the tile's
                         // executed instructions) to move 64 halves already contiguous.
+                        //
+                        // Masking tokens past kv_pos_end_in_block to zero scale/zp is what
+                        // neutralises the tail of a partial block for the *per-token*
+                        // layout. It is strictly redundant -- column c of block ki is at
+                        // partition offset ki*REG_N+c and the causal/partition mask already
+                        // forces exactly those columns to -inf -- but it is free here and
+                        // keeps the values bounded. compr=2 cannot use it for K (a
+                        // per-channel scale cannot single out a token) and does not need to.
                         vector<ushort, REG_N> lane_valid =
                             lane_idx < (ushort)kv_pos_end_in_block;
+#if KV_CACHE_COMPRESSION == 1
                         k_scale.merge(k_scale_zp_half.select<REG_N, 1>(0), lane_valid);
                         k_zp.merge(k_scale_zp_half.select<REG_N, 1>(KV_BLOCK_SIZE), lane_valid);
+#endif
                         v_scale.merge(v_scale_zp_half.select<REG_N, 1>(0), lane_valid);
                         v_zp.merge(v_scale_zp_half.select<REG_N, 1>(KV_BLOCK_SIZE), lane_valid);
 #endif
 #if PA_EXP_MAD_DEQUANT
                         // Two 16-element ops per tile, to save an element pass over the two
-                        // 256-element tiles below.
+                        // 256-element tiles below. K only folds this way for the per-token
+                        // layout; compr=2's K offset varies per channel, not per token.
+#if KV_CACHE_COMPRESSION == 1
                         k_nzs = cm_mul<half>(-k_zp, k_scale);
+#endif
                         v_nzs = cm_mul<half>(-v_zp, v_scale);
 #endif
                     }
@@ -765,6 +787,32 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             pfK.set_block_x(c * REG_K);
                             cm_prefetch(pfK);
                         }
+#if KV_CACHE_COMPRESSION == 2
+                        // Per-channel scale/zp for exactly this chunk's REG_K channels, one
+                        // vector per sub-block group. The metadata sits after the
+                        // KV_BLOCK_SIZE*HEAD_SIZE data bytes as [group][channel] halves,
+                        // scale first then zero-point, so each of these is a contiguous
+                        // REG_K*2 = 32 B read at a 32 B-aligned address. With
+                        // SUB_BLOCK_SIZE == KV_BLOCK_SIZE (GROUPS_PER_BLOCK == 1) it is one
+                        // read each per chunk.
+                        matrix<half, GROUPS_PER_BLOCK, REG_K> kc_scale = 0.0f;
+                        matrix<half, GROUPS_PER_BLOCK, REG_K> kc_zp = 0.0f;
+                        if ((uint)ki_m < block_num) {
+                            const uint szp_base = k_blk_base + KV_BLOCK_SIZE * HEAD_SIZE;
+                            #pragma unroll
+                            for (int g = 0; g < (int)GROUPS_PER_BLOCK; g++) {
+                                cm_svm_block_read<half, REG_K>(
+                                    (svmptr_t)(key + szp_base
+                                               + (g * HEAD_SIZE + c * REG_K) * sizeof(half)),
+                                    kc_scale.row(g).format<half>());
+                                cm_svm_block_read<half, REG_K>(
+                                    (svmptr_t)(key + szp_base
+                                               + ((GROUPS_PER_BLOCK + g) * HEAD_SIZE
+                                                  + c * REG_K) * sizeof(half)),
+                                    kc_zp.row(g).format<half>());
+                            }
+                        }
+#endif
 #if PA_EXP_FLAT_DEQUANT
                         matrix<half, REG_N, REG_K> KtNormal;
                         // Kq and KtNormal are both flat-contiguous, so this is one cast over
@@ -781,7 +829,16 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         #pragma unroll
                         for (int col = 0; col < REG_N; col++) {
                             KtNormal.row(col) = Kq.row(col);
-#if PA_EXP_MAD_DEQUANT
+#if KV_CACHE_COMPRESSION == 2
+                            // Per channel: the scale/zp vector spans the row (the REG_K
+                            // channels of this chunk) and is shared by every token row of
+                            // the group, so this is vector-vector where per-token is
+                            // vector-scalar. Same element count, same instruction count.
+                            // col is a compile-time unroll index, so the group select folds.
+                            KtNormal.row(col) = KtNormal.row(col) - kc_zp.row(col / SUB_BLOCK_SIZE);
+                            KtNormal.row(col) = cm_mul<half>(KtNormal.row(col),
+                                                             kc_scale.row(col / SUB_BLOCK_SIZE));
+#elif PA_EXP_MAD_DEQUANT
                             KtNormal.row(col) = KtNormal.row(col) * k_scale[col] + k_nzs[col];
 #else
                             KtNormal.row(col) = KtNormal.row(col) - k_zp[col];

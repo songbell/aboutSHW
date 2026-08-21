@@ -112,7 +112,9 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
         self.wg_threads = 1
         if (
             self.ov_exp_use_wg_shared_kv
-            and self.kv_cache_compression == 1
+            # compr=1 (K per token) and compr=2 (K per channel) both take the
+            # workgroup-shared path; only the K dequantize differs inside the kernel.
+            and self.kv_cache_compression in (1, 2)
             and q_rows > 8
         ):
             self.wg_threads = q_rows // self.rows_per_thread
@@ -351,6 +353,7 @@ _PAST_LENS_SWEEP = (64, 128, 144, 192, 1024, 4096, 15360)
     "q_len,past_len,cmpr,tile_q,block_size",
     [
         *[(6, past_len, 1, 6, 16) for past_len in _PAST_LENS_SWEEP],
+        *[(6, past_len, 2, 6, 16) for past_len in _PAST_LENS_SWEEP],
     ],
 )
 def test_ov_exp_correctness_vs_multi_token_matrix(
@@ -383,6 +386,15 @@ def test_ov_exp_correctness_vs_multi_token_matrix(
         *[(16, past_len, 1, 16, 16) for past_len in _PAST_LENS_SWEEP],
         *[(q_len, past_len, 1, 16, 16)
           for q_len in (13, 10, 5) for past_len in (192, 1024, 15360)],
+        # cmpr=2: K quantised per channel, V still per token. Same data layout and same
+        # workgroup-shared path; only the K dequantize differs. Partial blocks matter most
+        # here -- cmpr=1 neutralises a partial block's tail by zeroing its per-token
+        # scale/zp, which a per-channel scale cannot do, so cmpr=2 relies on the
+        # causal/partition mask alone. past_lens that are not multiples of the block or
+        # partition size cover that.
+        *[(16, past_len, 2, 16, 16) for past_len in _PAST_LENS_SWEEP],
+        *[(q_len, past_len, 2, 16, 16)
+          for q_len in (13, 5) for past_len in (192, 1024, 15360)],
     ],
 )
 def test_ov_exp_correctness_q16_and_tail_tiles(
