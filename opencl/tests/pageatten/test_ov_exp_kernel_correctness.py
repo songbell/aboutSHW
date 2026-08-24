@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'clops'))
 
 from clops import cl
+from kv_cache_quant_utils import DEFAULT_SUB_BLOCK_SIZE
 from test_pa_small_q import PaSmallQRunner, SmallQCase, _build_inputs as _build_small_q_inputs
 from test_pa_multiseq import PaMultiTokenRunner
 
@@ -65,9 +66,32 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
     can be exercised under the same host-side policy as pa_small_q_ov.cm.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, kv_partition_size: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.ov_exp_force_q_head_chunk_size = 4
+        # KV_PARTITION_SIZE, decoupled from KV_BLOCK_SIZE. The base runner only knows the
+        # ratio form (block_size * k_partition_block_num), which OV does not use: it picks
+        # both from the same has_xattention flag, so block 16 pairs with partition 128 and
+        # block 256 with partition 256 (see _ov_partition_size). Leaving the ratio in place
+        # would silently build a 2048-token partition for block 256.
+        if kv_partition_size is not None:
+            if int(kv_partition_size) % self.kv_step != 0:
+                raise ValueError(
+                    f"kv_partition_size ({kv_partition_size}) must be a multiple of "
+                    f"kv_step ({self.kv_step})"
+                )
+            self.kv_partition_size = int(kv_partition_size)
+            print(
+                f"PaSmallQOvExpRunner: kv_partition_size overridden to "
+                f"{self.kv_partition_size} (block_size={self.block_size})"
+            )
+        # OpenVINO derives Q_head_chunk_size from the model's GQA ratio
+        # (get_single_token_q_chunking), so it can be 1, 2, 4 or 8. It feeds
+        # Q_ROWS = Q_head_chunk_size * TILE_Q and hence WG_THREADS and the (t, qi)
+        # decomposition of a per-thread row index, so it needs coverage -- this was a
+        # hardcoded 4 and the env var below was read nowhere, which meant every sweep in
+        # this file tested exactly one value of it.
+        self.ov_exp_force_q_head_chunk_size = int(
+            os.environ.get("OV_FORCE_Q_HEAD_CHUNK_SIZE", "4"))
         self.ov_exp_use_wg_shared_kv = True
 
         online_tile_steps = 8
@@ -271,11 +295,23 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
         return out, t_partition_out, t_lse
 
 
-def _run_ov_exp(case: SmallQCase, data: dict) -> torch.Tensor:
+def _ov_partition_size(block_size: int) -> int:
+    """KV_PARTITION_SIZE that OV pairs with a given KV_BLOCK_SIZE.
+
+    paged_attention_gen.{hpp,cpp} tie both to has_xattention: KV_BLOCK_SIZE is
+    PA_KV_CACHE_BLOCK_SIZE_LEGACY (16) or PA_KV_CACHE_BLOCK_SIZE_XATTN (256), and
+    get_partition_size returns 128 for the legacy layout and PA_KV_CACHE_BLOCK_SIZE_XATTN
+    (256) for xattention. Those two pairs are the only ones the plugin ever builds.
+    """
+    return {16: 128, 256: 256}.get(block_size, block_size)
+
+
+def _run_ov_exp(case: SmallQCase, data: dict, kv_partition_size: int | None = None) -> torch.Tensor:
     runner = PaSmallQOvExpRunner(
         case.num_heads, case.num_kv_heads, case.head_size,
         case.block_size, case.sub_block_size, case.kv_cache_compression,
         tile_q=case.tile_q,
+        kv_partition_size=kv_partition_size or _ov_partition_size(case.block_size),
     )
     out = torch.zeros([case.q_len, case.num_heads, case.head_size], dtype=torch.float16)
     runner(
@@ -320,9 +356,12 @@ def _case_exp(
     cmpr: int,
     tile_q: int,
     block_size: int = 256,
+    sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
+    kv_partition_size: int | None = None,
 ) -> tuple[bool, float]:
     case = SmallQCase(
         num_heads=32, num_kv_heads=8, head_size=128, block_size=block_size,
+        sub_block_size=sub_block_size,
         past_len=past_len, q_len=q_len, kv_cache_compression=cmpr, tile_q=tile_q,
     )
     data = _build_small_q_inputs(case)
@@ -337,7 +376,7 @@ def _case_exp(
             "OV_FORCE_Q_HEAD_CHUNK_SIZE": "4",
         }
     ):
-        out_exp = _run_ov_exp(case, data)
+        out_exp = _run_ov_exp(case, data, kv_partition_size=kv_partition_size)
 
     diff = (out_exp.float() - out_base.float()).abs()
     max_diff = diff.max().item()
@@ -425,4 +464,134 @@ def test_ov_exp_correctness_q16_and_tail_tiles(
     assert max_diff < MAX_DIFF_TOL and not torch.isnan(out_exp).any().item(), (
         "ov_exp mismatch: "
         f"q_len={q_len} past_len={past_len} tile_q={tile_q} max_diff={max_diff:.4e}"
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# KV_BLOCK_SIZE = 256, the xattention cache layout.
+#
+# Everything above runs at block 16, which is degenerate: a cache block is then exactly one
+# KV_STEP online tile, so a tile ordinal and a block ordinal are the same number and the
+# kernel cannot tell them apart. At block 256 one block spans STEPS_PER_BLOCK = 16 tiles,
+# which separates the two: block_indices is indexed by pos / KV_BLOCK_SIZE, and each tile
+# additionally carries a within-block token offset (pos % KV_BLOCK_SIZE) that drives the 2D
+# descriptors' set_block_y and the address of its slice of the per-token / per-sub-block
+# scale and zero-point arrays.
+# ---------------------------------------------------------------------------------------
+
+_PAST_LENS_SWEEP_BLK256 = (
+    64,      # one partial block, and a partial *first* tile
+    200,     # partial tile mid-block (tok_in_blk 208) -- unreachable at block 16, where a
+             # partial tile is always the last tile of its block
+    250,     # block 0's last tile partial, 10 keys spilling into block 1
+    256,     # exact block boundary: block 1 exists but contributes nothing
+    272,     # block 1 holds exactly one full tile
+    1024,    # 4 whole blocks
+    4096,
+    15360,
+)
+
+
+@pytest.mark.parametrize(
+    "q_len,past_len,cmpr,tile_q",
+    [
+        *[(6, past_len, cmpr, 6)
+          for cmpr in (1, 2) for past_len in _PAST_LENS_SWEEP_BLK256],
+        *[(16, past_len, cmpr, 16)
+          for cmpr in (1, 2) for past_len in _PAST_LENS_SWEEP_BLK256],
+        # q_len < tile_q: threads owning rows past valid_count, on top of the block-256
+        # addressing.
+        *[(q_len, past_len, cmpr, 16)
+          for cmpr in (1, 2) for q_len in (13, 5) for past_len in (200, 250, 1024, 15360)],
+    ],
+)
+def test_ov_exp_correctness_block_size_256(
+    q_len: int,
+    past_len: int,
+    cmpr: int,
+    tile_q: int,
+):
+    """Block 256 / partition 256 -- the pair OV builds when xattention is on."""
+    passed, max_diff = _case_exp(
+        q_len=q_len,
+        past_len=past_len,
+        cmpr=cmpr,
+        tile_q=tile_q,
+        block_size=256,
+    )
+    assert passed, (
+        "ov_exp vs pa_multi_token mismatch at block_size=256: "
+        f"q_len={q_len} past_len={past_len} cmpr={cmpr} tile_q={tile_q} "
+        f"max_diff={max_diff:.4e}"
+    )
+
+
+@pytest.mark.parametrize(
+    "kv_partition_size",
+    [
+        128,   # partition *smaller* than a block: two partitions share one block, and a
+               # partition's first tile starts mid-block
+        512,   # partition spanning two blocks: block_indices advances inside one partition
+    ],
+)
+@pytest.mark.parametrize("past_len", [250, 1024, 4096])
+@pytest.mark.parametrize("cmpr", [1, 2])
+def test_ov_exp_correctness_block_256_partition_not_block(
+    cmpr: int,
+    past_len: int,
+    kv_partition_size: int,
+):
+    """KV_PARTITION_SIZE != KV_BLOCK_SIZE at block 256.
+
+    OV builds neither pair, but both are what the block ordinal being derived from the key
+    position (pos / KV_BLOCK_SIZE) rather than from a blocks-per-partition ratio buys. A
+    regression to the ratio form passes the partition == block sweep above and fails here,
+    so this is the cheap guard on that.
+    """
+    passed, max_diff = _case_exp(
+        q_len=16,
+        past_len=past_len,
+        cmpr=cmpr,
+        tile_q=16,
+        block_size=256,
+        kv_partition_size=kv_partition_size,
+    )
+    assert passed, (
+        "ov_exp vs pa_multi_token mismatch at block_size=256: "
+        f"past_len={past_len} cmpr={cmpr} kv_partition_size={kv_partition_size} "
+        f"max_diff={max_diff:.4e}"
+    )
+
+
+@pytest.mark.parametrize(
+    "sub_block_size",
+    [
+        16,    # GROUPS_PER_BLOCK 16 -- a tile's group index is its position in the block
+        64,    # GROUPS_PER_BLOCK 4 -- four tiles per group
+        256,   # GROUPS_PER_BLOCK 1 -- one scale/zp row for the whole block
+    ],
+)
+@pytest.mark.parametrize("past_len", [200, 250, 1024, 15360])
+def test_ov_exp_correctness_block_256_per_channel_sub_blocks(
+    past_len: int,
+    sub_block_size: int,
+):
+    """cmpr=2 (K per channel) at block 256, over the sub-block granularities.
+
+    SUB_BLOCK_SIZE decides how many scale/zp groups a block carries, and at block 256 a
+    tile sits at group tok_in_blk / SUB_BLOCK_SIZE rather than always at group 0. Reading
+    the wrong group dequantises K with another sub-block's scale, which the per-token
+    cmpr=1 path cannot expose.
+    """
+    passed, max_diff = _case_exp(
+        q_len=16,
+        past_len=past_len,
+        cmpr=2,
+        tile_q=16,
+        block_size=256,
+        sub_block_size=sub_block_size,
+    )
+    assert passed, (
+        "ov_exp vs pa_multi_token mismatch at block_size=256 cmpr=2: "
+        f"past_len={past_len} sub_block_size={sub_block_size} max_diff={max_diff:.4e}"
     )

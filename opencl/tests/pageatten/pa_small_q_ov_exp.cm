@@ -41,6 +41,13 @@ namespace KERNEL_NAME {
 //   lse                 : f32 [tile_count * TILE_Q, head, partition]
 //   Causal: row t in a tile sees past_lens + q_start + t + 1 keys.
 
+// Scope: the two quantised KV layouts. compr=1 quantises both K and V per *token*;
+// compr=2 quantises K per *channel* and keeps V per token. Uncompressed (fp16) KV is not
+// supported by this kernel.
+#if !KV_CACHE_COMPRESSION
+#error "pa_small_q: only KV_CACHE_COMPRESSION 1 and 2 are supported"
+#endif
+
 #if XE_ARCH==1
 #define REG_N 8
 #define USE_LSC_BLOCK_2D_DESC 0
@@ -49,12 +56,28 @@ namespace KERNEL_NAME {
 #define USE_LSC_BLOCK_2D_DESC 1
 #endif
 
+#if KV_STEP != REG_N
+    #error "KV_STEP must equal REG_N: one online tile is exactly one DPAS N-tile of keys"
+#endif
+
 #define SystolicDepth 8
 #define RepeatCount 1
 #define VNNI_WIDTH 2
 #define REG_K (SystolicDepth * VNNI_WIDTH)
 #define REG_M RepeatCount
 #define KV_PARTITION_STEP_NUM  (KV_PARTITION_SIZE / KV_STEP)
+
+// One online tile covers KV_STEP key positions, which is also the DPAS N width, so KV_STEP
+// must equal REG_N. A *cache block* holds KV_BLOCK_SIZE positions, which is 16 for the
+// legacy layout but 256 when xattention is enabled -- i.e. many online tiles per block. The
+// two must never be conflated: an online tile index is not a block index.
+#define STEPS_PER_BLOCK (KV_BLOCK_SIZE / KV_STEP)
+#if (KV_BLOCK_SIZE % KV_STEP) != 0
+    #error "KV_BLOCK_SIZE must be a whole number of KV_STEP online tiles"
+#endif
+#if (KV_PARTITION_SIZE % KV_STEP) != 0
+    #error "KV_PARTITION_SIZE must be a whole number of KV_STEP online tiles"
+#endif
 
 // Total q-rows handled by one SG. q_chunk Q-heads share one DPAS row; TILE_Q
 // q-tokens stack on top so DPAS RepeatCount = Q_ROWS = Q_head_chunk_size * TILE_Q.
@@ -74,9 +97,9 @@ namespace KERNEL_NAME {
 //     thread still reads the *whole* marshalled K/V tile regardless of how many q-rows it
 //     serves, so halving the rows doubles total SLM read traffic to buy +25% threads.
 #if Q_ROWS > 8
-    #if (Q_ROWS % 8) != 0
+#if (Q_ROWS % 8) != 0
         #error "Q_ROWS > 8 requires Q_ROWS to be divisible by 8"
-    #endif
+#endif
     #define ROWS_PER_THREAD 8
 #else
     #define ROWS_PER_THREAD Q_ROWS
@@ -124,24 +147,17 @@ namespace KERNEL_NAME {
 // Ablation probe, see the use sites: reuse head-dim chunk 0 for every chunk in both
 // consume loops. Removes 7/8 of the consume-phase SLM read traffic with an almost
 // unchanged instruction stream. Produces wrong results; measurement only.
-#ifndef PA_EXP_PROBE_SLM_REUSE
-#define PA_EXP_PROBE_SLM_REUSE 0
-#endif
 
 // Ablation probe, see the use site: make the whole K/V working set L1-resident by rotating
 // over 4 physical blocks. Isolates exposed DRAM latency/bandwidth from everything else.
 // Produces wrong results; measurement only.
-#ifndef PA_EXP_PROBE_KV_L1
-#define PA_EXP_PROBE_KV_L1 0
-#endif
 
 // How many online tiles ahead to software-prefetch K/V, via cm_prefetch.
 //
 // Round 14 deleted the raw-staging phase, which was double-buffered -- it loaded tile i+1
 // while tile i computed. The 2D block load that replaced it sits at the top of the tile with
 // the marshal consuming it immediately and a barrier right after, so DRAM latency became
-// fully exposed once per tile. The PA_EXP_PROBE_KV_L1 ablation (K/V forced L1-resident)
-// measures that exposure at -21.9 % of the main kernel, most of which is compulsory bus time
+// fully exposed once per tile. An ablation forcing K/V L1-resident measures that exposure at -21.9 % of the main kernel, most of which is compulsory bus time
 // for the 31.5 MB of K/V; a distance-1 prefetch recovers over half of it.
 //
 // Paired A/B on the main kernel, 8-10 rounds each: distance 1 = -11.8 % and -11.5 % in two
@@ -154,9 +170,6 @@ namespace KERNEL_NAME {
 // v*scale + (-zp*scale), and the second term is a per-token scalar that can be built once
 // per tile from 16-element vectors. Saves one whole element pass over the 256-element K and
 // V tiles -- and element passes, not instruction count, are what this kernel pays for.
-#ifndef PA_EXP_MAD_DEQUANT
-#define PA_EXP_MAD_DEQUANT 0
-#endif
 
 // Do the online-softmax shift per row instead of as one whole-tile expression. The
 // whole-tile form has to *materialise* the per-row max as a broadcast matrix
@@ -164,39 +177,56 @@ namespace KERNEL_NAME {
 // exec 32 that is 4 mov + 4 add + 4 mul = 24 cycles for 128 floats. Per row it is 8 mads at
 // exec 16 = 8 cycles. Round 4's MATRIX_SOFTMAX chose the whole-tile form on instruction
 // count, which round 15 showed is the wrong metric.
-#ifndef PA_EXP_ROW_SHIFT
-#define PA_EXP_ROW_SHIFT 0
-#endif
 
 // Head-dim chunks fetched per SLM read in the two consume loops. Chunks are contiguous in
 // slm_Kt/slm_Vt, so a wider read returns N adjacent chunks in one message, each still a
 // contiguous 8-GRF region and therefore still a legal direct DPAS operand. Byte traffic is
 // unchanged; only the message count drops. Separates "SLM bytes" from "SLM messages" as the
 // cost of the consume phase.
-#ifndef PA_EXP_WIDE_SLM_READ
-#define PA_EXP_WIDE_SLM_READ 1
-#endif
+
+// Measured and rejected, recorded so they are not re-tried blind (see PROFILING.md):
+//   * wider SLM reads in the consume loops -- 512 B is the hardware maximum for an SLM block
+//     read, so a 2-chunk read is split back into two messages and buys nothing.
+//   * double-buffering the marshalled operands to drop the pre-marshal barrier: correct, and
+//     -0.7 %. Removing *both* barriers is worth -12 %, so the cost is the workgroup lockstep
+//     itself, not the barrier count.
+//   * software-pipelining the marshal against the consume (marshal tile t while consuming
+//     tile t-1 from the other slot): correct, but -4.1 % over 10 rounds and +12.1 % over 14,
+//     i.e. unresolvable on the available rig.
+//   * folding the dequantize's sub+mul into one mad, and whole-tile instead of per-row
+//     dequantize: both remove element work and both measure +1 to +3 %. At ~30 % ALU
+//     utilisation, ALU work is not what this kernel pays for.
+
+#define KV_PREFETCH_DIST 1
+
+// Fold the dequantize's subtract and multiply into one mad: (v - zp)*scale is
+// v*scale + (-zp*scale), and the second term is a per-token scalar that can be built once
+// per tile from 16-element vectors. Saves one whole element pass over the 256-element K and
+// V tiles -- and element passes, not instruction count, are what this kernel pays for.
+
+// Do the online-softmax shift per row instead of as one whole-tile expression. The
+// whole-tile form has to *materialise* the per-row max as a broadcast matrix
+// (new_max.replicate<...>) before it can subtract it, which is a third element pass: at
+// exec 32 that is 4 mov + 4 add + 4 mul = 24 cycles for 128 floats. Per row it is 8 mads at
+// exec 16 = 8 cycles. Round 4's MATRIX_SOFTMAX chose the whole-tile form on instruction
+// count, which round 15 showed is the wrong metric.
+
+// Head-dim chunks fetched per SLM read in the two consume loops. Chunks are contiguous in
+// slm_Kt/slm_Vt, so a wider read returns N adjacent chunks in one message, each still a
+// contiguous 8-GRF region and therefore still a legal direct DPAS operand. Byte traffic is
+// unchanged; only the message count drops. Separates "SLM bytes" from "SLM messages" as the
+// cost of the consume phase.
 
 // --- Ablation probes. All produce wrong results; measurement only. Each removes one
 // resource while leaving the values it feeds live and data-dependent, so IGC cannot fold
-// away the surrounding work (see the round 7 note on PA_EXP_ABLATE_SCALEZP for why that
-// discipline matters).
+// away the surrounding work (ablations must remove traffic while leaving values live).
 //
 // NO_MARSHAL_ALU: keep the global 2D load and the 512 B SLM write, drop the dequantize and
 // the transpose/VNNI pack in between. Isolates the marshal's ALU from its memory traffic.
-#ifndef PA_EXP_PROBE_NO_MARSHAL_ALU
-#define PA_EXP_PROBE_NO_MARSHAL_ALU 0
-#endif
 // NO_SOFTMAX: keep rS live and P fed from it, drop the row-max tree, the rescale guards and
 // the exponentials.
-#ifndef PA_EXP_PROBE_NO_SOFTMAX
-#define PA_EXP_PROBE_NO_SOFTMAX 0
-#endif
 // NO_BARRIER: drop both barriers per online tile. All work stays; only the workgroup
 // lockstep goes away.
-#ifndef PA_EXP_PROBE_NO_BARRIER
-#define PA_EXP_PROBE_NO_BARRIER 0
-#endif
 
 // Double-buffer the marshalled operands, so one barrier per online tile suffices instead of
 // two. With a single slm_Kt/slm_Vt the loop needs a barrier *before* the marshal (so tile
@@ -209,13 +239,9 @@ namespace KERNEL_NAME {
 // The ablation suite puts both barriers at -12.0 % of the main kernel. Cost is 8 -> 16 KiB
 // of SLM per workgroup, which is free here: at 192 GRF residency is 6 workgroups per
 // Xe-core, i.e. 96 KiB of the 128 KiB available.
-#ifndef PA_EXP_DBL_SLM
-#define PA_EXP_DBL_SLM 0
-#endif
 
 // Software-pipeline the marshal against the consume: iteration t marshals tile t while
-// consuming tile t-1, with one barrier at the end. Requires PA_EXP_DBL_SLM (the two are
-// touching different slots by construction) and implies it below.
+// consuming tile t-1, with one barrier at the end. Requires double-buffered marshalled operands.
 //
 // The ablation suite says the marshal's dequantize + transpose chain is worth -13.6 % of the
 // main kernel, yet removing a fifth of its element work measures +1.7 %. All-or-nothing like
@@ -228,21 +254,11 @@ namespace KERNEL_NAME {
 // consumes tile t-1 (skipped on the first). Slot t&1 is written while slot (t-1)&1 is read,
 // and slot t&1's previous reader was iteration t-1's consume of tile t-2, which the barrier
 // at the end of t-1 already ordered.
-#ifndef PA_EXP_PIPE_MARSHAL
-#define PA_EXP_PIPE_MARSHAL 0
-#endif
-#if PA_EXP_DBL_SLM || PA_EXP_PIPE_MARSHAL
-#define SLM_SLOTS 2
-#else
 #define SLM_SLOTS 1
-#endif
 
 // Pin the online_tile unroll factor. On a kernel near the GRF ceiling IGC spends any freed
 // register slack on more unrolling, so a change that removes work can silently double the
 // code instead of speeding anything up (see PROFILING.md round 3). 0 = let IGC choose.
-#ifndef PA_EXP_TILE_UNROLL
-#define PA_EXP_TILE_UNROLL 0
-#endif
 
 // Dequantize the whole REG_N x REG_K tile with flat/whole-matrix ops instead of one row at
 // a time. Kept OFF: it does exactly what it claims and is worth nothing, which is the
@@ -257,26 +273,27 @@ namespace KERNEL_NAME {
 // vector scale/zp copy, which deleted 96 exec-**1** instructions and won 4-8 %. The cost
 // model on this kernel is pipe cycles at width 16, so widening an already-vector loop pays
 // nothing; only deleting element-work or exec-1 scalar code does. See PROFILING.md round 15.
-#ifndef PA_EXP_FLAT_DEQUANT
-#define PA_EXP_FLAT_DEQUANT 0
-#endif
 
 // Restore the old per-token scalar scale/zp gather, for re-measuring the vector form.
-#ifndef PA_EXP_SCALAR_SCALEZP
-#define PA_EXP_SCALAR_SCALEZP 0
-#endif
 #define PA_PRAGMA_STR(x) _Pragma(#x)
 #define PA_PRAGMA_UNROLL(n) PA_PRAGMA_STR(unroll n)
 
 #if KV_CACHE_COMPRESSION
-    #if KV_CACHE_COMPRESSION == 2
+#if KV_CACHE_COMPRESSION == 2
     #define GROUPS_PER_BLOCK (KV_BLOCK_SIZE / SUB_BLOCK_SIZE)
+    // Sub-block groups spanned by one online tile. 1 whenever SUB_BLOCK_SIZE >= KV_STEP,
+    // which is the usual case (both 16).
+    #if SUB_BLOCK_SIZE >= KV_STEP
+    #define GROUPS_PER_TILE 1
+    #else
+    #define GROUPS_PER_TILE (KV_STEP / SUB_BLOCK_SIZE)
+    #endif
     #define K_SCALE_ZP_SIZE (4 * GROUPS_PER_BLOCK)
     #define V_SCALE_ZP_SIZE 4
-    #elif KV_CACHE_COMPRESSION == 1
+#elif KV_CACHE_COMPRESSION == 1
     #define K_SCALE_ZP_SIZE 4
     #define V_SCALE_ZP_SIZE 4
-    #endif
+#endif
     #define KV_ELEMENT_TYPE uint8_t
 #else
     #define V_SCALE_ZP_SIZE 0
@@ -322,7 +339,10 @@ struct MatRowMax<ROWS, 1> {
 // selected_q_mapping is packed as i32 triples:
 //   [orig_seq_idx_0, q_start_0, valid_count_0,
 //    orig_seq_idx_1, q_start_1, valid_count_1, ...]
-// Length = 3 * tile_count. cm_global_id(0) indexes the tile list directly.
+// Length = 3 * tile_count. One *workgroup* handles one tile: the host dispatches
+// gws[0] = tile_count * WG_THREADS with lws[0] = WG_THREADS, so cm_group_id(0) indexes the
+// tile list. WG_THREADS is 1 when Q_ROWS <= 8 and the path below is unchanged in that case:
+// the single thread marshals all MARSHAL_CHUNKS chunks and the barriers are trivial.
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
     half* query [[type("svmptr_t")]],
     KV_ELEMENT_TYPE* key [[type("svmptr_t")]],
@@ -340,7 +360,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     // tile_idx indexes the host-packed (orig_seq, q_start, valid_count) triple list.
     // Keep the original global-id path for lws[0]=1, and switch to group-based
     // indexing only when the experimental workgroup-shared path is enabled.
-    const uint tile_idx = (cm_local_size(0) > 1) ? cm_group_id(0) : cm_global_id(0);
+    const uint tile_idx = cm_group_id(0);
     const uint local_qg = cm_local_id(0);
     if (tile_idx >= (uint)selected_token_count) {
         return;
@@ -369,10 +389,10 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     const uint kv_len_max          = past_q_lens + q_start + valid_count;       // tile-wide upper bound
     const uint seq_kv_partition_num = (kv_len_max + KV_PARTITION_SIZE - 1) / KV_PARTITION_SIZE;
 
+
     const uint block_begin = block_indices_begins[orig_seq_idx];
     const uint block_end   = block_indices_begins[orig_seq_idx + 1];
 
-    const uint blocks_per_partition = (KV_PARTITION_SIZE / KV_BLOCK_SIZE);
     constexpr uint kv_pitch = HEAD_SIZE * sizeof(KV_ELEMENT_TYPE);
 
     constexpr uint per_v_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + V_SCALE_ZP_SIZE);
@@ -391,11 +411,9 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 // pitch HEAD_SIZE -- so the 2D block load, the transpose, the SLM sharing and everything
 // downstream are unchanged. Only where the scale/zp vector comes from, and which axis it
 // broadcasts along, differ. V is per-token in both.
-#if KV_CACHE_COMPRESSION >= 1
-    if (cm_local_size(0) > 1) {
-        if (local_qg >= WG_THREADS) {
-            return;
-        }
+    if (local_qg >= WG_THREADS) {
+        return;
+    }
 
         // Cooperative marshalling: every thread in the WG consumes the same K/V tile, so
         // the dequantize + transpose/VNNI-pack is shared work. Stage the DPAS-ready
@@ -423,7 +441,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 
         const uint subgroup_row_base = local_qg * ROWS_PER_THREAD;
         matrix<half, ROWS_PER_THREAD, HEAD_SIZE> Qmat_group = 0;
-        #if (ROWS_PER_THREAD % Q_head_chunk_size) == 0
+#if (ROWS_PER_THREAD % Q_head_chunk_size) == 0
         #pragma unroll
         for (int tg = 0; tg < (ROWS_PER_THREAD / Q_head_chunk_size); tg++) {
             const int global_row = subgroup_row_base + tg * Q_head_chunk_size;
@@ -437,7 +455,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 (svmptr_t)(query + qo_offset),
                 Qmat_group.select<Q_head_chunk_size, 1, HEAD_SIZE, 1>(tg * Q_head_chunk_size, 0).format<half>());
         }
-        #else
+#else
         #pragma unroll
         for (int row = 0; row < ROWS_PER_THREAD; row++) {
             const int global_row = subgroup_row_base + row;
@@ -452,7 +470,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 (svmptr_t)(query + qo_offset),
                 Qmat_group.row(row).format<half>());
         }
-        #endif
+#endif
 
         // Q and O are held *chunk-major*: head-dim chunk `ri` is a contiguous register
         // region, which is what DPAS needs. A DPAS dst/src0 must be consecutive GRFs and
@@ -496,8 +514,11 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             return;
         }
 
-        const uint start_block_idx = block_begin + kv_partition_idx * blocks_per_partition;
-        if (kv_partition_idx * KV_PARTITION_SIZE >= kv_len_max || start_block_idx >= block_end) {
+        // Ordinal of the first cache block this partition touches. Derived from the key
+        // position rather than from a blocks-per-partition ratio, so it stays correct when a
+        // block is larger than a partition as well as smaller.
+        const uint first_blk_ord = (kv_partition_idx * KV_PARTITION_SIZE) / KV_BLOCK_SIZE;
+        if (kv_partition_idx * KV_PARTITION_SIZE >= kv_len_max || block_begin + first_blk_ord >= block_end) {
             #pragma unroll
             for (int row = 0; row < ROWS_PER_THREAD; row++) {
                 const int global_row = subgroup_row_base + row;
@@ -518,11 +539,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 lse[lse_offset] = -3e38f;
             }
             return;
-        }
-
-        uint block_num = blocks_per_partition;
-        if (block_num > block_end - start_block_idx) {
-            block_num = block_end - start_block_idx;
         }
 
         uint leftover_size = 0;
@@ -574,69 +590,55 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             // instead of sitting on every tile's critical path -- and it makes tile i+1's
             // prefetch address available with no load at all.
             vector<uint, KV_PARTITION_STEP_NUM> blk_idx_cache = 0;
+            // ...and the token offset of the tile *inside* that block. With KV_BLOCK_SIZE
+            // 256 and KV_STEP 16 a block spans 16 online tiles, so this is what tells the 2D
+            // descriptors which rows to read (set_block_y) and where the tile's per-token
+            // scale/zero-point live.
+            vector<uint, KV_PARTITION_STEP_NUM> tok_in_blk_cache = 0;
             #pragma unroll
             for (int ki = 0; ki < KV_PARTITION_STEP_NUM; ki++) {
-                uint kv_pos_end_in_block = 0;
-                const uint block_idx = ki;
-                if (block_idx < block_num) {
-                    const uint block_start_in_partition = block_idx * KV_BLOCK_SIZE;
-                    if (partition_valid > block_start_in_partition) {
-                        kv_pos_end_in_block = partition_valid - block_start_in_partition;
-                        if (kv_pos_end_in_block > KV_BLOCK_SIZE) {
-                            kv_pos_end_in_block = KV_BLOCK_SIZE;
-                        }
+                // Valid key positions in *this online tile*, in [0, KV_STEP]. Note this is a
+                // per-tile count, not a per-block one: the two coincide only when
+                // STEPS_PER_BLOCK == 1.
+                const uint pos_in_part = (uint)ki * KV_STEP;
+                uint tile_valid = 0;
+                if (partition_valid > pos_in_part) {
+                    tile_valid = partition_valid - pos_in_part;
+                    if (tile_valid > KV_STEP) {
+                        tile_valid = KV_STEP;
                     }
-                    blk_idx_cache[ki] = block_indices[start_block_idx + block_idx];
                 }
-                kv_pos_end_cache[ki] = kv_pos_end_in_block;
+                if (tile_valid > 0) {
+                    const uint pos_global = kv_partition_idx * KV_PARTITION_SIZE + pos_in_part;
+                    const uint blk_ord = pos_global / KV_BLOCK_SIZE;   // block ordinal in the sequence
+                    if (block_begin + blk_ord < block_end) {
+                        blk_idx_cache[ki] = block_indices[block_begin + blk_ord];
+                        tok_in_blk_cache[ki] = pos_global % KV_BLOCK_SIZE;
+                    } else {
+                        tile_valid = 0;
+                    }
+                }
+                kv_pos_end_cache[ki] = tile_valid;
             }
 
 
-#if PA_EXP_TILE_UNROLL
-            PA_PRAGMA_UNROLL(PA_EXP_TILE_UNROLL)
-#else
             #pragma unroll
-#endif
-#if PA_EXP_PIPE_MARSHAL
-            for (int online_tile = 0; online_tile < NUM_ONLINE_TILES + 1; online_tile++) {
-#else
             for (int online_tile = 0; online_tile < NUM_ONLINE_TILES; online_tile++) {
-#endif
-#if PA_EXP_PIPE_MARSHAL
-                const int m_tile   = online_tile;                  // marshalled this pass
-                const int c_tile   = online_tile - 1;              // consumed this pass
-                const int ki_base_m = m_tile * ONLINE_TILE_STEPS;
-                const int ki_base   = c_tile * ONLINE_TILE_STEPS;
-                const uint slm_slot_k_m = (uint)(m_tile & 1) * KT_BYTES;
-                const uint slm_slot_v_m = (uint)(m_tile & 1) * VT_BYTES;
-                const uint slm_slot_k   = (uint)(c_tile & 1) * KT_BYTES;
-                const uint slm_slot_v   = (uint)(c_tile & 1) * VT_BYTES;
-#else
                 const int ki_base = online_tile * ONLINE_TILE_STEPS;
                 const int ki_base_m = ki_base;
-#endif
-#if !PA_EXP_PIPE_MARSHAL
-#if PA_EXP_DBL_SLM
-                const uint slm_slot_k = (uint)(online_tile & 1) * KT_BYTES;
-                const uint slm_slot_v = (uint)(online_tile & 1) * VT_BYTES;
-#else
                 const uint slm_slot_k = 0;
                 const uint slm_slot_v = 0;
-#endif
                 const uint slm_slot_k_m = slm_slot_k;
                 const uint slm_slot_v_m = slm_slot_v;
-#endif
 
                 matrix<float, ROWS_PER_THREAD, ONLINE_TILE_STEPS * REG_N> rS_tile = 0;
                 matrix<half, ROWS_PER_THREAD, ONLINE_TILE_STEPS * REG_N> P_tile = 0;
 
-#if !PA_EXP_PROBE_NO_BARRIER && !PA_EXP_DBL_SLM
                 // Pre-marshal barrier: with a single set of marshalled buffers this tile's
                 // writes must not overtake the previous tile's reads. Unnecessary once the
-                // buffers are double-buffered -- see PA_EXP_DBL_SLM.
+                // marshalled buffers were double-buffered.
                 cm_fence(CM_LOCAL_BARRIER);
                 cm_barrier();
-#endif
 
 
                 // ---- Cooperative marshalling ------------------------------------------
@@ -649,9 +651,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 // to the barrier below. The barrier itself stays outside this guard so the
                 // whole workgroup still meets at it.
                 if (local_qg < MARSHAL_TG
-#if PA_EXP_PIPE_MARSHAL
-                    && m_tile < NUM_ONLINE_TILES
-#endif
                    ) {
                 #pragma unroll
                 for (int li_m = 0; li_m < ONLINE_TILE_STEPS; li_m++) {
@@ -664,10 +663,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     vector<half, REG_N> k_zp = 0.0f;
                     vector<half, REG_K> v_scale = 0.0f;
                     vector<half, REG_K> v_zp = 0.0f;
-#if PA_EXP_MAD_DEQUANT
-                    vector<half, REG_N> k_nzs = 0.0f;   // -zp*scale, folded dequant offset
-                    vector<half, REG_K> v_nzs = 0.0f;
-#endif
                     // Needed by the 2D descriptors in the chunk loops below. When the block
                     // is out of range these stay 0 and the load reads block 0 -- harmless,
                     // because k_scale/k_zp are 0 for those tokens so the dequantized value
@@ -679,55 +674,52 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     // address is harmless, so no guard is needed.
                     uint k_blk_next = 0;
                     uint v_blk_next = 0;
+                    uint tok_in_blk_next = 0;
                     if (ki_m + KV_PREFETCH_DIST < KV_PARTITION_STEP_NUM
-                        && (uint)(ki_m + KV_PREFETCH_DIST) < block_num) {
+                        && kv_pos_end_cache[ki_m + KV_PREFETCH_DIST] > 0) {
                         const uint bn = blk_idx_cache[ki_m + KV_PREFETCH_DIST];
+                        tok_in_blk_next = tok_in_blk_cache[ki_m + KV_PREFETCH_DIST];
                         k_blk_next = bn * per_k_block_element_num
                                    + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
                         v_blk_next = bn * per_v_block_element_num
                                    + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
                     }
-                    if ((uint)ki_m < block_num) {
+                    // Token offset of this online tile inside its cache block. Zero when
+                    // STEPS_PER_BLOCK == 1; a multiple of KV_STEP otherwise.
+                    const uint tok_in_blk = tok_in_blk_cache[ki_m];
+                    if (kv_pos_end_cache[ki_m] > 0) {
                         const uint kv_pos_end_in_block = kv_pos_end_cache[ki_m];
-#if PA_EXP_PROBE_KV_L1
-                        // ABLATION, numerically wrong on purpose: rotate over 4 physical KV
-                        // blocks so the whole working set is L1-resident. Every send, address
-                        // computation and dependency is preserved -- only the DRAM latency
-                        // and bandwidth are removed. The index still varies per tile so the
-                        // loads cannot be CSE'd or hoisted out of the loop.
-                        const uint blk_indices = (start_block_idx + (uint)ki_m) & 3u;
-#else
                         const uint blk_indices = blk_idx_cache[ki_m];
-#endif
                         const uint k_base_offset = blk_indices * per_k_block_element_num
                                                  + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
                         k_blk_base = k_base_offset;
 #if KV_CACHE_COMPRESSION == 1
-                        vector<uint, KV_BLOCK_SIZE> k_scale_zp_block;
-                        cm_svm_block_read<uint, KV_BLOCK_SIZE>(
-                            (svmptr_t)(key + k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE), k_scale_zp_block);
-                        auto k_scale_zp_half = k_scale_zp_block.format<half>();
+                        // Per-token scale/zp live after the KV_BLOCK_SIZE*HEAD_SIZE data
+                        // bytes as [KV_BLOCK_SIZE] halves of scale then [KV_BLOCK_SIZE] of
+                        // zero-point. Read only this tile's REG_N entries at its offset in
+                        // the block -- reading the whole block would be KV_BLOCK_SIZE*4 bytes
+                        // per thread per tile, which is 1 KiB at KV_BLOCK_SIZE 256.
+                        // tok_in_blk is a multiple of KV_STEP so the address is 32 B aligned.
+                        const uint k_szp = k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
+                        vector<half, REG_N> k_scale_raw, k_zp_raw;
+                        cm_svm_block_read<half, REG_N>(
+                            (svmptr_t)(key + k_szp + tok_in_blk * sizeof(half)), k_scale_raw);
+                        cm_svm_block_read<half, REG_N>(
+                            (svmptr_t)(key + k_szp + (KV_BLOCK_SIZE + tok_in_blk) * sizeof(half)),
+                            k_zp_raw);
 #endif
 
                         const uint v_base_offset = blk_indices * per_v_block_element_num
                                                  + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
                         v_blk_base = v_base_offset;
-                        vector<uint, KV_BLOCK_SIZE> v_scale_zp_block;
-                        cm_svm_block_read<uint, KV_BLOCK_SIZE>(
-                            (svmptr_t)(value + v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE), v_scale_zp_block);
-                        auto v_scale_zp_half = v_scale_zp_block.format<half>();
+                        const uint v_szp = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
+                        vector<half, REG_K> v_scale_raw, v_zp_raw;
+                        cm_svm_block_read<half, REG_K>(
+                            (svmptr_t)(value + v_szp + tok_in_blk * sizeof(half)), v_scale_raw);
+                        cm_svm_block_read<half, REG_K>(
+                            (svmptr_t)(value + v_szp + (KV_BLOCK_SIZE + tok_in_blk) * sizeof(half)),
+                            v_zp_raw);
 
-#if PA_EXP_SCALAR_SCALEZP
-                        #pragma unroll
-                        for (int i = 0; i < REG_N; i++) {
-                            if ((uint)i < kv_pos_end_in_block) {
-                                k_scale[i] = k_scale_zp_half[i];
-                                k_zp[i]    = k_scale_zp_half[KV_BLOCK_SIZE + i];
-                                v_scale[i] = v_scale_zp_half[i];
-                                v_zp[i]    = v_scale_zp_half[KV_BLOCK_SIZE + i];
-                            }
-                        }
-#else
                         // Vector-masked copy. The per-token loop above is semantically
                         // identical but IGC unrolls it into REG_N predicated *scalar*
                         // blocks -- 6 exec-1 instructions and a branch each, 109
@@ -744,21 +736,11 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         vector<ushort, REG_N> lane_valid =
                             lane_idx < (ushort)kv_pos_end_in_block;
 #if KV_CACHE_COMPRESSION == 1
-                        k_scale.merge(k_scale_zp_half.select<REG_N, 1>(0), lane_valid);
-                        k_zp.merge(k_scale_zp_half.select<REG_N, 1>(KV_BLOCK_SIZE), lane_valid);
+                        k_scale.merge(k_scale_raw, lane_valid);
+                        k_zp.merge(k_zp_raw, lane_valid);
 #endif
-                        v_scale.merge(v_scale_zp_half.select<REG_N, 1>(0), lane_valid);
-                        v_zp.merge(v_scale_zp_half.select<REG_N, 1>(KV_BLOCK_SIZE), lane_valid);
-#endif
-#if PA_EXP_MAD_DEQUANT
-                        // Two 16-element ops per tile, to save an element pass over the two
-                        // 256-element tiles below. K only folds this way for the per-token
-                        // layout; compr=2's K offset varies per channel, not per token.
-#if KV_CACHE_COMPRESSION == 1
-                        k_nzs = cm_mul<half>(-k_zp, k_scale);
-#endif
-                        v_nzs = cm_mul<half>(-v_zp, v_scale);
-#endif
+                        v_scale.merge(v_scale_raw, lane_valid);
+                        v_zp.merge(v_zp_raw, lane_valid);
                     }
 
                     // K and V marshalled in separate loops so their working sets do not
@@ -778,6 +760,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                                 key + k_blk_base, KV_BLOCK_SIZE - 1,
                                 HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
                             b2dK.set_block_x(c * REG_K);
+                            b2dK.set_block_y(tok_in_blk);
                             cm_load<lsc::Normal>(Kq.format<uint8_t>(), b2dK);
                         }
                         {
@@ -785,6 +768,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                                 key + k_blk_next, KV_BLOCK_SIZE - 1,
                                 HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
                             pfK.set_block_x(c * REG_K);
+                            pfK.set_block_y(tok_in_blk_next);
                             cm_prefetch(pfK);
                         }
 #if KV_CACHE_COMPRESSION == 2
@@ -795,37 +779,28 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         // REG_K*2 = 32 B read at a 32 B-aligned address. With
                         // SUB_BLOCK_SIZE == KV_BLOCK_SIZE (GROUPS_PER_BLOCK == 1) it is one
                         // read each per chunk.
-                        matrix<half, GROUPS_PER_BLOCK, REG_K> kc_scale = 0.0f;
-                        matrix<half, GROUPS_PER_BLOCK, REG_K> kc_zp = 0.0f;
-                        if ((uint)ki_m < block_num) {
+                        matrix<half, GROUPS_PER_TILE, REG_K> kc_scale = 0.0f;
+                        matrix<half, GROUPS_PER_TILE, REG_K> kc_zp = 0.0f;
+                        if (kv_pos_end_cache[ki_m] > 0) {
                             const uint szp_base = k_blk_base + KV_BLOCK_SIZE * HEAD_SIZE;
+                            // Group of the tile's *first* token within the block. Only the
+                            // GROUPS_PER_TILE groups this tile actually spans are read.
+                            const uint g_base = tok_in_blk / SUB_BLOCK_SIZE;
                             #pragma unroll
-                            for (int g = 0; g < (int)GROUPS_PER_BLOCK; g++) {
+                            for (int g = 0; g < (int)GROUPS_PER_TILE; g++) {
                                 cm_svm_block_read<half, REG_K>(
                                     (svmptr_t)(key + szp_base
-                                               + (g * HEAD_SIZE + c * REG_K) * sizeof(half)),
+                                               + ((g_base + g) * HEAD_SIZE + c * REG_K) * sizeof(half)),
                                     kc_scale.row(g).format<half>());
                                 cm_svm_block_read<half, REG_K>(
                                     (svmptr_t)(key + szp_base
-                                               + ((GROUPS_PER_BLOCK + g) * HEAD_SIZE
+                                               + ((GROUPS_PER_BLOCK + g_base + g) * HEAD_SIZE
                                                   + c * REG_K) * sizeof(half)),
                                     kc_zp.row(g).format<half>());
                             }
                         }
 #endif
-#if PA_EXP_FLAT_DEQUANT
-                        matrix<half, REG_N, REG_K> KtNormal;
-                        // Kq and KtNormal are both flat-contiguous, so this is one cast over
-                        // 256 elements rather than REG_N separate row casts.
-                        KtNormal.format<half>() = Kq.format<uint8_t>();
-                        KtNormal = KtNormal - k_zp.replicate<REG_N, 1, REG_K, 0>();
-                        KtNormal = cm_mul<half>(KtNormal, k_scale.replicate<REG_N, 1, REG_K, 0>());
-#else
                         matrix<half, REG_N, REG_K> KtNormal = 0;
-#if PA_EXP_PROBE_NO_MARSHAL_ALU
-                        KtNormal.format<uint8_t>().select<REG_N * REG_K, 1>(0) =
-                            Kq.format<uint8_t>();
-#else
                         #pragma unroll
                         for (int col = 0; col < REG_N; col++) {
                             KtNormal.row(col) = Kq.row(col);
@@ -838,26 +813,20 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             KtNormal.row(col) = KtNormal.row(col) - kc_zp.row(col / SUB_BLOCK_SIZE);
                             KtNormal.row(col) = cm_mul<half>(KtNormal.row(col),
                                                              kc_scale.row(col / SUB_BLOCK_SIZE));
-#elif PA_EXP_MAD_DEQUANT
-                            KtNormal.row(col) = KtNormal.row(col) * k_scale[col] + k_nzs[col];
+                            // col is the token's index *within the online tile*, so
+                            // col / SUB_BLOCK_SIZE is its group relative to g_base above.
 #else
                             KtNormal.row(col) = KtNormal.row(col) - k_zp[col];
                             KtNormal.row(col) = cm_mul<half>(KtNormal.row(col), k_scale[col]);
 #endif
                         }
-#endif
-#endif
                         matrix<half, REG_K, REG_N> Kt_m = 0;
-#if PA_EXP_PROBE_NO_MARSHAL_ALU
-                        Kt_m.format<half>() = KtNormal.format<half>();
-#else
                         Transpose_8x8(
                             KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(0,0),
                             Kt_m.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
                         Transpose_8x8(
                             KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(8,0),
                             Kt_m.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
-#endif
                         auto Kt_bytes = Kt_m.format<uint8_t>();
                         #pragma unroll
                         for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
@@ -877,6 +846,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                                 value + v_blk_base, KV_BLOCK_SIZE - 1,
                                 HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
                             b2dV.set_block_x(c * REG_N);
+                            b2dV.set_block_y(tok_in_blk);
                             cm_load<lsc::Normal>(Vq.format<uint8_t>(), b2dV);
                         }
                         {
@@ -884,38 +854,19 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                                 value + v_blk_next, KV_BLOCK_SIZE - 1,
                                 HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
                             pfV.set_block_x(c * REG_N);
+                            pfV.set_block_y(tok_in_blk_next);
                             cm_prefetch(pfV);
                         }
-#if PA_EXP_FLAT_DEQUANT
-                        matrix<half, REG_K, REG_N> VmatNormal;
-                        VmatNormal.format<half>() = Vq.format<uint8_t>();
-                        VmatNormal = VmatNormal - v_zp.replicate<REG_K, 1, REG_N, 0>();
-                        VmatNormal = cm_mul<half>(VmatNormal, v_scale.replicate<REG_K, 1, REG_N, 0>());
-#else
                         matrix<half, REG_K, REG_N> VmatNormal = 0;
-#if PA_EXP_PROBE_NO_MARSHAL_ALU
-                        VmatNormal.format<uint8_t>().select<REG_K * REG_N, 1>(0) =
-                            Vq.format<uint8_t>();
-#else
                         #pragma unroll
                         for (int r = 0; r < REG_K; r++) {
                             VmatNormal[r] = Vq.row(r);
-#if PA_EXP_MAD_DEQUANT
-                            VmatNormal[r] = VmatNormal[r] * v_scale[r] + v_nzs[r];
-#else
                             VmatNormal[r] = VmatNormal[r] - v_zp[r];
                             VmatNormal[r] = cm_mul<half>(VmatNormal[r], v_scale[r]);
-#endif
                         }
-#endif
-#endif
                         matrix<half, REG_K/2, REG_N*2> Vmat_m;
-#if PA_EXP_PROBE_NO_MARSHAL_ALU
-                        Vmat_m.format<half>() = VmatNormal.format<half>();
-#else
                         Vmat_m.select<REG_K/2, 1, REG_N, 2>(0, 0) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(0, 0);
                         Vmat_m.select<REG_K/2, 1, REG_N, 2>(0, 1) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(1, 0);
-#endif
                         auto Vt_bytes = Vmat_m.format<uint8_t>();
                         #pragma unroll
                         for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
@@ -925,18 +876,8 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     }
                 }
                 } /* local_qg < MARSHAL_TG */
-#if PA_EXP_PIPE_MARSHAL
-                // No barrier between marshal and consume: they touch different slots, and
-                // the consume's operands were published by the previous iteration's barrier.
-                // Leaving them adjacent is the whole point -- it gives IGC the consume's DPAS
-                // work to schedule into the marshal's dependency chain.
-                if (c_tile >= 0) {
-#else
-#if !PA_EXP_PROBE_NO_BARRIER
                 cm_slm_fence(CM_LOCAL_BARRIER);
                 cm_barrier();
-#endif
-#endif
 
                 #pragma unroll
                 for (int li = 0; li < ONLINE_TILE_STEPS; li++) {
@@ -950,28 +891,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     // loop spilled, but that was with the row-major layout, where each
                     // unrolled copy needed its own gathered Qmat_data temporary; with
                     // chunk-major there are no temporaries and GRF *drops* (154 -> 148).
-#if PA_EXP_WIDE_SLM_READ > 1
-                    #pragma unroll
-                    for (int rb = 0; rb < (HEAD_SIZE / REG_K) / PA_EXP_WIDE_SLM_READ; rb++) {
-                        matrix<half, PA_EXP_WIDE_SLM_READ * REG_K, REG_N> Ktw;
-                        cm_slm_block_read(slm_Kt, GENX_DWALIGNED,
-                                          slm_slot_k + (li * MARSHAL_CHUNKS + rb * PA_EXP_WIDE_SLM_READ)
-                                              * MARSHAL_CHUNK_BYTES,
-                                          Ktw.format<uint8_t>());
-                        #pragma unroll
-                        for (int w = 0; w < PA_EXP_WIDE_SLM_READ; w++) {
-                            const int ri = rb * PA_EXP_WIDE_SLM_READ + w;
-                            auto Kt = Ktw.select<REG_K, 1, REG_N, 1>(w * REG_K, 0);
-                            auto Qmat_data = Qchunks[ri].format<half, ROWS_PER_THREAD, REG_K>();
-                            auto rS_acc = rS_tile.select<ROWS_PER_THREAD, 1, REG_N, 1>(0, li * REG_N);
-                            rS_acc = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth,
-                                             ROWS_PER_THREAD>(
-                                        rS_acc.format<float>(), Kt.format<int32_t>(),
-                                        Qmat_data.format<int32_t>());
-                        }
-                    }
-                    if (false)
-#endif
                     #pragma unroll
                     for (int k = 0, ri = 0; k < HEAD_SIZE / REG_K; k += 1, ri++) {
                         // Already dequantized, transposed and VNNI-packed by the marshalling
@@ -979,15 +898,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         matrix<half, REG_K, REG_N> Kt;
                         {
                             auto Kt_in = Kt.format<uint8_t>();
-#if PA_EXP_PROBE_SLM_REUSE
-                            // ABLATION, numerically wrong on purpose: every head-dim chunk
-                            // reads chunk 0, so 7/8 of the consume-phase SLM read traffic
-                            // disappears while Kt stays live and data-dependent. Isolates
-                            // "is consume SLM read the limiter" from instruction count.
-                            const uint chunk_in = (li * MARSHAL_CHUNKS) * MARSHAL_CHUNK_BYTES;
-#else
                             const uint chunk_in = (li * MARSHAL_CHUNKS + ri) * MARSHAL_CHUNK_BYTES;
-#endif
                             #pragma unroll
                             for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
                                 cm_slm_block_read(slm_Kt, GENX_DWALIGNED,
@@ -1049,6 +960,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     }
                 }
 
+
                 // Whole-tile online softmax. Every step below -- the max tree, the shift,
                 // the exp, the denominator accumulate and the fp16 pack -- runs over the
                 // full ROWS_PER_THREAD x REG_N tile, so each is a handful of full-width
@@ -1057,13 +969,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 // data-dependent per row.
                 {
                     constexpr int SM_N = ONLINE_TILE_STEPS * REG_N;
-#if PA_EXP_PROBE_NO_SOFTMAX
-                    // ABLATION: drop the row-max tree, the per-row rescale guards and the
-                    // exponentials. rS stays live and still feeds P and the denominator, so
-                    // nothing upstream folds away.
-                    P_tile.format<half>() = rS_tile.format<float>();
-                    final_sum_acc.format<float>() += rS_tile.format<float>();
-#else
                     vector<float, ROWS_PER_THREAD> tile_max =
                         MatRowMax<ROWS_PER_THREAD, SM_N>::apply(
                             rS_tile.select<ROWS_PER_THREAD, 1, SM_N, 1>(0, 0));
@@ -1081,28 +986,12 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     }
                     final_max = new_max;
 
-#if PA_EXP_ROW_SHIFT
-                    // exp2((rS - m) * log2e) == exp2(rS*log2e - m*log2e): scale the row max
-                    // once (8 elements) so each row becomes a single mad against a scalar,
-                    // with no broadcast matrix to materialise.
-                    vector<float, ROWS_PER_THREAD> nm_l2 = cm_mul<float>(new_max, log2e_wg);
-                    matrix<float, ROWS_PER_THREAD, SM_N> shifted_m;
-                    #pragma unroll
-                    for (int row = 0; row < ROWS_PER_THREAD; row++) {
-                        shifted_m.row(row) =
-                            rS_tile.row(row) * log2e_wg - nm_l2[row];
-                    }
-                    vector<float, ROWS_PER_THREAD * SM_N> exp_all =
-                        cm_exp(shifted_m.format<float>());
-#else
                     vector<float, ROWS_PER_THREAD * SM_N> shifted =
                         (rS_tile.format<float>()
                          - new_max.replicate<ROWS_PER_THREAD, 1, SM_N, 0>()) * log2e_wg;
                     vector<float, ROWS_PER_THREAD * SM_N> exp_all = cm_exp(shifted);
-#endif
                     final_sum_acc.format<float>() += exp_all;
                     P_tile.format<half>() = exp_all;
-#endif
                 }
 
                 #pragma unroll
@@ -1112,50 +1001,12 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         continue;
                     }
 
-                    bool block_valid = false;
-                    uint v_base_offset = 0;
-                    uint kv_pos_end_in_block = 0;
-                    const uint block_idx = ki;
-                    if (block_idx < block_num) {
-                        block_valid = true;
-                        const uint blk_indices = block_indices[start_block_idx + block_idx];
-                        v_base_offset = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
-                        kv_pos_end_in_block = kv_pos_end_cache[ki];
-                    }
-
-#if PA_EXP_WIDE_SLM_READ > 1
-                    #pragma unroll
-                    for (int rb = 0; rb < (HEAD_SIZE / REG_N) / PA_EXP_WIDE_SLM_READ; rb++) {
-                        matrix<half, PA_EXP_WIDE_SLM_READ * REG_K / 2, REG_N * 2> Vtw;
-                        cm_slm_block_read(slm_Vt, GENX_DWALIGNED,
-                                          slm_slot_v + (li_v * MARSHAL_CHUNKS + rb * PA_EXP_WIDE_SLM_READ)
-                                              * MARSHAL_CHUNK_BYTES,
-                                          Vtw.format<uint8_t>());
-                        #pragma unroll
-                        for (int w = 0; w < PA_EXP_WIDE_SLM_READ; w++) {
-                            const int ri = rb * PA_EXP_WIDE_SLM_READ + w;
-                            auto Vmat = Vtw.select<REG_K / 2, 1, REG_N * 2, 1>(w * REG_K / 2, 0);
-                            matrix<half, ROWS_PER_THREAD, REG_K> Pmat_data =
-                                P_tile.select<ROWS_PER_THREAD, 1, REG_K, 1>(0, li_v * REG_N);
-                            auto Omat_data = Omat[ri].format<float, ROWS_PER_THREAD, REG_N>();
-                            Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth,
-                                                ROWS_PER_THREAD>(
-                                        Omat_data.format<float>(), Vmat.format<int32_t>(),
-                                        Pmat_data.format<int32_t>());
-                        }
-                    }
-                    if (false)
-#endif
                     #pragma unroll
                     for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
                         matrix<half, REG_K/2, REG_N*2> Vmat;
                         {
                             auto Vt_in = Vmat.format<uint8_t>();
-#if PA_EXP_PROBE_SLM_REUSE
-                            const uint chunk_in = (li_v * MARSHAL_CHUNKS) * MARSHAL_CHUNK_BYTES;
-#else
                             const uint chunk_in = (li_v * MARSHAL_CHUNKS + ri) * MARSHAL_CHUNK_BYTES;
-#endif
                             #pragma unroll
                             for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
                                 cm_slm_block_read(slm_Vt, GENX_DWALIGNED,
@@ -1174,17 +1025,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     }
                 }
 
-#if PA_EXP_PIPE_MARSHAL
-                } /* c_tile >= 0 */
-                // The single barrier of the pipelined form. It publishes this iteration's
-                // marshal of tile t to every thread before iteration t+1 consumes it, and it
-                // orders this iteration's consume of tile t-1 ahead of iteration t+1's
-                // marshal into that same slot.
-#if !PA_EXP_PROBE_NO_BARRIER
-                cm_slm_fence(CM_LOCAL_BARRIER);
-                cm_barrier();
-#endif
-#else
                 // No barrier here. All threads must finish consuming slm_Kt / slm_Vt before
                 // the next iteration's marshal overwrites them, but the barrier at the top
                 // of the loop body already guarantees exactly that, and with the raw-staging
@@ -1192,7 +1032,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 // 10-12 round A/Bs put the removal at -3.6 % and -1.1 %; call it ~2 %, which
                 // is at this rig's resolution limit, but it never measured positive and it
                 // deletes a synchronisation point that provably separated nothing.
-#endif
             }
         }
 
@@ -1237,8 +1076,6 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             + kv_partition_idx;
             lse[lse_offset] = (row_valid && final_sum[row] > 0.0f) ? cur_lse[row] : -3e38f;
         }
-        return;
-    }
-#endif
-    }
+}
+
 }  // namespace KERNEL_NAME
