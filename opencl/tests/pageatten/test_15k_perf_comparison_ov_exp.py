@@ -129,7 +129,15 @@ def _run_perf_with_runner_exp(runner, case: SmallQCase, loop_cnt: int = 60, warm
     }
 
 
-def _benchmark_small_q_online_exp(case: SmallQCase) -> PerfResult:
+def _benchmark_small_q_online_exp(case: SmallQCase, kv_partition_size: int | None = None) -> PerfResult:
+    """Benchmark the experimental kernel on `case`.
+
+    kv_partition_size pins KV_PARTITION_SIZE directly instead of deriving it as
+    block_size * partition_block_num. Both forms reach the same kernel, but at block 256
+    the ratio form is the wrong knob: OV picks block and partition from the same
+    has_xattention flag (16/128 and 256/256), so a partition_block_num carried over from
+    a block-16 sweep silently builds a multi-thousand-token partition.
+    """
     old_force = os.environ.get("OV_FORCE_Q_HEAD_CHUNK_SIZE")
     old_shared = os.environ.get("OV_EXP_USE_WG_SHARED_KV")
     os.environ["OV_FORCE_Q_HEAD_CHUNK_SIZE"] = "4"
@@ -144,6 +152,7 @@ def _benchmark_small_q_online_exp(case: SmallQCase) -> PerfResult:
             case.kv_cache_compression,
             tile_q=case.tile_q,
             k_partition_block_num=case.partition_block_num,
+            kv_partition_size=kv_partition_size,
         )
 
         data = _build_small_q_inputs(case)
@@ -245,3 +254,48 @@ def test_15k_small_q_online_exp_block_size_16(q_len: int, cmpr: int):
     result = _benchmark_small_q_online_exp(case)
     result_id = next(_RESULT_COUNTER)
     print(f"\n[Result #{result_id:02d}] {result}")
+
+
+# KV_PARTITION_SIZE that OV pairs with KV_BLOCK_SIZE=256 (get_partition_size returns
+# PA_KV_CACHE_BLOCK_SIZE_XATTN when has_xattention). Mirrors _ov_partition_size in
+# test_ov_exp_kernel_correctness.py, which is the file that owns that mapping.
+_OV_PARTITION_SIZE_BLK256 = 256
+
+
+@pytest.mark.parametrize("q_len", [6, 16])
+@pytest.mark.parametrize("cmpr", [1, 2])
+def test_15k_small_q_online_exp_block_size_256(q_len: int, cmpr: int):
+    """Profile the experimental kernel at block 256 -- the xattention cache layout.
+
+    Same 15 k point as the block-16 test above, so the two are directly comparable on
+    kernel_ms. The KV traffic is identical; what changes is that a cache block now spans
+    STEPS_PER_BLOCK = 16 online tiles instead of exactly one, so consecutive tiles walk a
+    within-block token offset rather than re-reading block_indices, and the scale/zp rows
+    for a tile sit at group tok_in_blk / SUB_BLOCK_SIZE.
+
+    Correctness for this configuration lives in
+    test_ov_exp_kernel_correctness.py::test_ov_exp_correctness_block_size_256.
+    """
+    if os.environ.get("RUN_PA_PERF", "0") != "1":
+        pytest.skip("Set RUN_PA_PERF=1 to enable perf test")
+
+    case = SmallQCase(
+        num_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        block_size=256,
+        past_len=PAST_LEN_15K,
+        q_len=q_len,
+        kv_cache_compression=cmpr,
+        tile_q=q_len,
+        # Unused: kv_partition_size below pins KV_PARTITION_SIZE outright. Left at the
+        # dataclass default so it is obvious the ratio form is not in play here.
+        partition_block_num=1,
+    )
+    # 256 is what OV builds. The block-16 test's partition sweep (pb=32..128 at 15 k)
+    # found larger partitions win by shrinking the fp32 partials the reduce kernel reads
+    # back, and at 15 k a 256-token partition means 60 of them -- so this point is
+    # expected to be reduce-heavy, and re-running the sweep here is worthwhile.
+    result = _benchmark_small_q_online_exp(case, kv_partition_size=_OV_PARTITION_SIZE_BLK256)
+    result_id = next(_RESULT_COUNTER)
+    print(f"\n[Result #{result_id:02d}] {result} | block=256 partition={_OV_PARTITION_SIZE_BLK256}")
