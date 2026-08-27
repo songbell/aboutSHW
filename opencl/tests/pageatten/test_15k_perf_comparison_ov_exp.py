@@ -16,7 +16,7 @@ from test_15k_perf_comparison import (
     _stats_from_samples,
     _time_kernel,
 )
-from test_ov_exp_kernel_correctness import PaSmallQOvExpRunner
+from test_ov_exp_kernel_correctness import PaSmallQOvExpRunner, _ov_partition_size
 from test_pa_small_q import SmallQCase
 from clops import cl
 
@@ -299,3 +299,109 @@ def test_15k_small_q_online_exp_block_size_256(q_len: int, cmpr: int):
     result = _benchmark_small_q_online_exp(case, kv_partition_size=_OV_PARTITION_SIZE_BLK256)
     result_id = next(_RESULT_COUNTER)
     print(f"\n[Result #{result_id:02d}] {result} | block=256 partition={_OV_PARTITION_SIZE_BLK256}")
+
+
+# ---------------------------------------------------------------------------------------
+# Partition-size regression guard
+# ---------------------------------------------------------------------------------------
+# KV_PARTITION_SIZE sets the workgroup count for the small-q pair:
+#     WGs = kv_heads * q_head_chunks_per_kv_head * ceil(context / KV_PARTITION_SIZE)
+# so a partition tuned on a long context starves the machine on a short one. A 640-token
+# partition at past_len=512 leaves a *single* partition, i.e. 8 workgroups of 3 threads -- 24
+# threads on a part that holds ~160 -- and measured 3.3x slower than a 128-token partition.
+# It is also the term that sets the fp32 partial traffic the finalization reads back, which
+# pulls the other way and dominates at long context. There is no good constant, only a good
+# compromise, and it is easy to re-break this by tuning on one context length again.
+#
+# This test does not hardcode milliseconds (they are machine-specific). It sweeps the
+# partition axis and asserts that whatever the host *selects* stays close to the best value
+# measured in the same run, at every context length. That is exactly the property that was
+# violated, and it holds regardless of which GPU runs it.
+_PARTITION_SWEEP = (128, 256, 384, 512, 640)
+_PARTITION_PAST_LENS = (512, 2048, 8192, PAST_LEN_15K)
+_PARTITION_Q_LENS = (6, 16)
+# The rule is measured, so it should be close to the per-case best everywhere. These bounds are
+# set so the rule passes with room and any single pinned value fails clearly -- 640 scored
+# worst +227 % / mean +53 % here, 256 scored +47 % / +21 % across the wider domain.
+_PARTITION_WORST_TOL = 0.30
+_PARTITION_MEAN_TOL = 0.12
+
+
+def _plugin_small_q_partition(max_context_len: int) -> int:
+    """Mirror of pick_small_q_partition() in paged_attention_gen.hpp.
+
+    Kept in lockstep by hand -- if the plugin table changes and this does not, the guard below
+    stops testing what actually ships.
+    """
+    if max_context_len <= 768:
+        return 128
+    if max_context_len <= 1536:
+        return 256
+    if max_context_len <= 6144:
+        return 384
+    return 640
+
+
+def test_small_q_partition_choice():
+    """The partition RULE must be competitive at every context length.
+
+    KV_PARTITION_SIZE is a runtime scalar, so the host picks it per inference from
+    max_context_len. That knob sets the workgroup count at one end and the fp32 partial traffic
+    at the other, and the balance moves with context -- which is why a single pinned value
+    cannot work and why this guard sweeps the domain rather than checking one number. A value
+    tuned only at 15 k once left a single partition at past_len=512 (8 workgroups of 3 threads)
+    and ran 3.3x slower.
+
+    Absolute milliseconds are not portable, so the assertion is relative: whatever the rule
+    selects must be close to the best candidate measured in the SAME run.
+    """
+    if os.environ.get("RUN_PA_PERF", "0") != "1":
+        pytest.skip("Set RUN_PA_PERF=1 to enable perf test")
+
+    block_size = 256
+    forced = os.environ.get("PA_FORCE_PARTITION")   # exists to verify this guard both ways
+
+    penalties, rows = [], []
+    for q_len in _PARTITION_Q_LENS:
+        for past_len in _PARTITION_PAST_LENS:
+            ctx = past_len + q_len
+            selected = int(forced) if forced else _plugin_small_q_partition(ctx)
+            assert selected in _PARTITION_SWEEP, (
+                f"partition {selected} for context {ctx} is not in the sweep; add it to "
+                f"_PARTITION_SWEEP so this guard measures what the host actually uses")
+            totals = {}
+            for part in _PARTITION_SWEEP:
+                case = SmallQCase(
+                    num_heads=32, num_kv_heads=8, head_size=128, block_size=block_size,
+                    past_len=past_len, q_len=q_len, kv_cache_compression=2,
+                    tile_q=q_len, partition_block_num=1,
+                )
+                runner = PaSmallQOvExpRunner(
+                    case.num_heads, case.num_kv_heads, case.head_size, case.block_size,
+                    case.sub_block_size, case.kv_cache_compression,
+                    tile_q=case.tile_q, kv_partition_size=part,
+                )
+                perf = _run_perf_with_runner_exp(runner, case)
+                totals[part] = perf["small_q_ms"] + perf["small_q_reduce_ms"]
+            best = min(totals, key=totals.get)
+            pen = totals[selected] / totals[best] - 1.0
+            penalties.append(pen)
+            rows.append((q_len, past_len, totals, best, selected, pen))
+
+    print(f"\n{'q':>3} {'past':>6} " + " ".join(f"{p:>8}" for p in _PARTITION_SWEEP)
+          + f" {'best':>5} {'rule':>5} {'penalty':>8}")
+    for q_len, past_len, totals, best, selected, pen in rows:
+        print(f"{q_len:>3} {past_len:>6} "
+              + " ".join(f"{totals[p]:>8.3f}" for p in _PARTITION_SWEEP)
+              + f" {best:>5} {selected:>5} {pen * 100:>7.1f}%")
+
+    worst, mean = max(penalties), sum(penalties) / len(penalties)
+    label = f"forced {forced}" if forced else "rule"
+    print(f"\n{label}: worst +{worst * 100:.1f}%, mean +{mean * 100:.1f}%")
+    assert worst <= _PARTITION_WORST_TOL, (
+        f"{label} is {worst * 100:.0f}% off the best at some context length (limit "
+        f"{_PARTITION_WORST_TOL * 100:.0f}%). See the table above; a partition policy tuned on "
+        f"one context length is the usual cause.")
+    assert mean <= _PARTITION_MEAN_TOL, (
+        f"{label} averages {mean * 100:.0f}% off the best (limit "
+        f"{_PARTITION_MEAN_TOL * 100:.0f}%); see the table above.")

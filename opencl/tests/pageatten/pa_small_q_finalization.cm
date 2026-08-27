@@ -24,6 +24,33 @@
 //     t_in_tile   = token_row % TILE_Q
 // Dummy rows (t_in_tile >= valid_count) have lse = -inf written by the kernel,
 // but we still early-return them here to avoid writing junk into the host output.
+// MEASURED (container rig, q_len=16, 15360 past, block 256, reduce ms by KV_PARTITION_SIZE):
+//
+//                          part 256   part 512   part 1024
+//   REDUCE_OPT 0 (orig)      0.186      0.099      0.038
+//   REDUCE_OPT 1             0.181      0.096      0.036     bit-exact, adopted
+//   REDUCE_OPT 2             0.181      0.095      0.036     not bit-exact, no better
+//
+// The restructuring is worth ~3 %, which is the useful negative result here: the scalar lse
+// loads look wasteful (three sweeps, two exps and a divide per partition) but the lse slice is
+// a few hundred bytes per thread and stays cached, so it was never the cost. The reduce is
+// bandwidth-bound on the *partial* buffer -- 16.0 MB in 0.181 ms at partition 256 is 89 GB/s.
+//
+// So the levers that actually matter for this kernel are the ones that move bytes, in order:
+//   1. KV_PARTITION_SIZE. Partials are q_len * heads * partitions * head_size * 4 bytes, so
+//      256 -> 1024 cuts them 4x and the reduce 5.0x. This dwarfs everything else here.
+//   2. REDUCE_SPLIT_SIZE. head_size / split is the thread count, and cost tracks it almost
+//      exactly (split 8/16/32/64/128 -> 0.330/0.201/0.136/0.099/0.095 at partition 512),
+//      because the lse max and sum sweeps do not depend on split and every split of the same
+//      (row, head) repeats them. 128 -- one split per row/head -- is the minimum.
+//   3. fp16 partials, which would halve the traffic. Measured at one fp16 ulp of extra error
+//      (see pa_small_q_ov_exp.cm) but deliberately not adopted.
+//
+// Selects the reduce structure; see the comment at the accumulation loops below.
+#ifndef REDUCE_OPT
+#define REDUCE_OPT 1
+#endif
+
 extern "C" _GENX_MAIN_ void cm_pa_small_q_reduce(
     float* input [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
@@ -53,10 +80,38 @@ extern "C" _GENX_MAIN_ void cm_pa_small_q_reduce(
     const int total_partition_num = (kv_partition_num * HEADS_NUM);
 
     // Logsumexp across partitions for this (token_row, head).
+    //
+    // REDUCE_OPT selects how much of the original three-pass structure survives:
+    //   0  original. Three sweeps over lse, every element read as a *scalar* load, cm_exp
+    //      evaluated twice per partition, and one divide per partition.
+    //   1  same arithmetic, but lse is pulled in 16-wide block reads instead of scalars. The
+    //      running max and the running sum are still folded in the original element order, and
+    //      max is order-independent anyway, so this is bit-exact.
+    //   2  additionally fuses the sum sweep into the accumulate sweep: partials are summed
+    //      unnormalised and divided once at the end. Halves the exp count and replaces
+    //      kv_partition_num divides with one. Not bit-exact -- it reassociates the division --
+    //      though it rounds strictly less often.
+    //
+    // The lse values for one (token_row, head) are contiguous, so the block read is the natural
+    // access; the scalar form was costing one memory round trip per partition per pass, which is
+    // why the reduce scaled with thread count rather than with bytes moved.
     float total_lse = 0.0;
     uint lse_offset = token_row * total_partition_num + head * kv_partition_num;
     constexpr float log2e = 1.4426950408889634f;
     float* lse_vec = lse + lse_offset;
+
+    constexpr int LSE_BLK = 16;
+    const int lse_nblk = kv_partition_num / LSE_BLK;
+    const int lse_tail = lse_nblk * LSE_BLK;
+
+    matrix<half, 1, REDUCE_SPLIT_SIZE> out_mat = 0;
+    matrix<float, 1, REDUCE_SPLIT_SIZE> out_mat_f32 = 0;
+    matrix<float, 1, REDUCE_SPLIT_SIZE> data_mat;
+    uint input_offset = token_row * total_partition_num * HEAD_SIZE
+                      + head * kv_partition_num * HEAD_SIZE
+                      + offset;
+
+#if REDUCE_OPT == 0
     float lse_max = lse_vec[0];
     for (int k = 1; k < kv_partition_num; k++) {
         lse_max = cm_max<float>(lse_vec[k], lse_max);
@@ -75,13 +130,6 @@ extern "C" _GENX_MAIN_ void cm_pa_small_q_reduce(
         total_lse += lse_value;
     }
 
-    matrix<half, 1, REDUCE_SPLIT_SIZE> out_mat = 0;
-    matrix<float, 1, REDUCE_SPLIT_SIZE> out_mat_f32 = 0;
-    matrix<float, 1, REDUCE_SPLIT_SIZE> data_mat;
-    uint input_offset = token_row * total_partition_num * HEAD_SIZE
-                      + head * kv_partition_num * HEAD_SIZE
-                      + offset;
-
     for (int k = 0; k < iter * 16; k += 16) {
         #pragma unroll
         for (int ki = k; ki < k + 16; ki++) {
@@ -97,6 +145,77 @@ extern "C" _GENX_MAIN_ void cm_pa_small_q_reduce(
         float lse_value = cm_exp<float>((lse_vec[k] - lse_max) * log2e);
         out_mat_f32 += cm_mul<float>(data_mat, (float)(lse_value/total_lse));
     }
+#else
+    // Pass 1: running max. Folded in the original order; max is associative and exact, so the
+    // block read cannot change the result.
+    vector<float, LSE_BLK> lv;
+    float lse_max = lse_vec[0];
+    for (int b = 0; b < lse_nblk; b++) {
+        cm_svm_block_read<float, LSE_BLK>((svmptr_t)(lse_vec + b * LSE_BLK), lv);
+        #pragma unroll
+        for (int i = 0; i < LSE_BLK; i++) {
+            lse_max = cm_max<float>(lv[i], lse_max);
+        }
+    }
+    for (int k = lse_tail; k < kv_partition_num; k++) {
+        lse_max = cm_max<float>(lse_vec[k], lse_max);
+    }
+
+#if REDUCE_OPT == 1
+    // Pass 2: denominator, same accumulation order as the original.
+    for (int b = 0; b < lse_nblk; b++) {
+        cm_svm_block_read<float, LSE_BLK>((svmptr_t)(lse_vec + b * LSE_BLK), lv);
+        vector<float, LSE_BLK> w = cm_exp((lv - lse_max) * log2e);
+        #pragma unroll
+        for (int i = 0; i < LSE_BLK; i++) {
+            total_lse += w[i];
+        }
+    }
+    for (int k = lse_tail; k < kv_partition_num; k++) {
+        total_lse += cm_exp<float>((lse_vec[k] - lse_max) * log2e);
+    }
+
+    // Pass 3: weighted accumulate.
+    for (int b = 0; b < lse_nblk; b++) {
+        cm_svm_block_read<float, LSE_BLK>((svmptr_t)(lse_vec + b * LSE_BLK), lv);
+        vector<float, LSE_BLK> w = cm_exp((lv - lse_max) * log2e);
+        #pragma unroll
+        for (int i = 0; i < LSE_BLK; i++) {
+            cm_svm_block_read<float, REDUCE_SPLIT_SIZE>((svmptr_t)(input + input_offset), data_mat.format<float>());
+            input_offset += HEAD_SIZE;
+            out_mat_f32 += cm_mul<float>(data_mat, (float)(w[i] / total_lse));
+        }
+    }
+    for (int k = lse_tail; k < kv_partition_num; k++) {
+        cm_svm_block_read<float, REDUCE_SPLIT_SIZE>((svmptr_t)(input + input_offset), data_mat.format<float>());
+        input_offset += HEAD_SIZE;
+        float lse_value = cm_exp<float>((lse_vec[k] - lse_max) * log2e);
+        out_mat_f32 += cm_mul<float>(data_mat, (float)(lse_value / total_lse));
+    }
+#else
+    // Pass 2 (fused): accumulate the numerator unnormalised alongside the denominator, so the
+    // partials are swept once instead of twice and exp is evaluated once per partition.
+    for (int b = 0; b < lse_nblk; b++) {
+        cm_svm_block_read<float, LSE_BLK>((svmptr_t)(lse_vec + b * LSE_BLK), lv);
+        vector<float, LSE_BLK> w = cm_exp((lv - lse_max) * log2e);
+        #pragma unroll
+        for (int i = 0; i < LSE_BLK; i++) {
+            cm_svm_block_read<float, REDUCE_SPLIT_SIZE>((svmptr_t)(input + input_offset), data_mat.format<float>());
+            input_offset += HEAD_SIZE;
+            out_mat_f32 += cm_mul<float>(data_mat, w[i]);
+            total_lse += w[i];
+        }
+    }
+    for (int k = lse_tail; k < kv_partition_num; k++) {
+        cm_svm_block_read<float, REDUCE_SPLIT_SIZE>((svmptr_t)(input + input_offset), data_mat.format<float>());
+        input_offset += HEAD_SIZE;
+        float lse_value = cm_exp<float>((lse_vec[k] - lse_max) * log2e);
+        out_mat_f32 += cm_mul<float>(data_mat, lse_value);
+        total_lse += lse_value;
+    }
+    out_mat_f32 = cm_mul<float>(out_mat_f32, 1.0f / total_lse);
+#endif
+#endif
 
     out_mat = cm_mul<half>(out_mat_f32, (float)1.0f);
 

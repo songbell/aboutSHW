@@ -154,13 +154,19 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
         )
 
     @staticmethod
-    @functools.lru_cache(maxsize=8)
+    @functools.lru_cache(maxsize=32)
     def _create_kernels_ov_exp(
         num_heads, num_kv_heads, head_size, kv_step, block_size, sub_block_size,
         kv_partition_size, reduce_split_step, clean_unused_kvcache,
         kv_cache_compression, xe_arch, q_head_chunks_per_kv_head,
         q_head_chunk_size, tile_q, scale_factor, source_stamp,
+        reg_file_size, extra_flags,
     ):
+        # reg_file_size and extra_flags are parameters, not os.environ reads, because the
+        # lru_cache key is the argument tuple: anything read from the environment inside this
+        # body is invisible to the cache, so two builds differing only by an env var silently
+        # return the same kernel. That made an in-process A/B of a -D flag compare a kernel
+        # against itself and report a 0.0% delta for a change known to cost 45%.
         src = '\n'.join([
             '#include "pa_small_q_ov_exp.cm"',
             '#include "pa_small_q_finalization.cm"',
@@ -170,7 +176,7 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
             src,
             f'''-cmc -Qxcm_jit_option=""
                         -mCM_printregusage
-                        -Qxcm_register_file_size={os.environ.get("OV_EXP_REG_FILE_SIZE", _DEFAULT_REG_FILE)} -I{cwd}
+                        -Qxcm_register_file_size={reg_file_size} -I{cwd}
                         -DHEADS_NUM={num_heads} -DKV_HEADS_NUM={num_kv_heads} -DHEAD_SIZE={head_size}
                         -DQ_STEP=32 -DKV_STEP={kv_step}
                         -DKV_BLOCK_SIZE={block_size}
@@ -184,7 +190,7 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
                         -DTILE_Q={tile_q}
                         -DSCALE_FACTOR={scale_factor}
                         -DOV_EXP_SOURCE_STAMP={source_stamp}
-                        -DKERNEL_NAME=cm_pa_small_q {os.environ.get("OV_EXP_EXTRA_FLAGS", "")}''',
+                        -DKERNEL_NAME=cm_pa_small_q {extra_flags}''',
         )
 
     def _create_kernels(self):
@@ -207,6 +213,8 @@ class PaSmallQOvExpRunner(PaSmallQRunner):
             self.tile_q,
             self.scale_factor,
             source_stamp,
+            os.environ.get("OV_EXP_REG_FILE_SIZE", _DEFAULT_REG_FILE),
+            os.environ.get("OV_EXP_EXTRA_FLAGS", ""),
         )
 
     def dispatch_dims(self, tile_count: int, kv_partition_num: int):

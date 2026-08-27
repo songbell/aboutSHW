@@ -121,7 +121,16 @@ namespace KERNEL_NAME {
 // marshal phase. At WG_THREADS == MARSHAL_CHUNKS_C == 8 the default gives CPT=1, i.e.
 // 16-byte reads. Widening that by marshalling on fewer threads was measured
 // slower: the lost parallelism costs more than the saved sends.
-#if WG_THREADS > MARSHAL_CHUNKS_C
+// Overridable so the chunks-per-thread lever can be swept. The marshal is latency-bound on
+// its load -> convert -> dequant -> transpose -> SLM write chain, not throughput-bound on
+// element count (removing a third of the element work buys 0.9 % where removing all of the
+// dequantize buys 16.9 %). Chains from different chunks are independent, so giving one thread
+// several chunks lets them interleave and hide each other's latency -- at the cost of idling
+// the threads that no longer marshal. At WG_THREADS == MARSHAL_CHUNKS_C == 8 the default hands
+// each thread exactly one chunk, i.e. one chain with nothing to overlap it.
+#ifdef MARSHAL_TG_OVERRIDE
+#define MARSHAL_TG MARSHAL_TG_OVERRIDE
+#elif WG_THREADS > MARSHAL_CHUNKS_C
 // More threads than chunks: extra threads would get MARSHAL_CPT == 0 and marshal nothing
 // while still being counted, so cap at one chunk each.
 #define MARSHAL_TG MARSHAL_CHUNKS_C
@@ -147,6 +156,113 @@ namespace KERNEL_NAME {
 // Ablation probe, see the use sites: reuse head-dim chunk 0 for every chunk in both
 // consume loops. Removes 7/8 of the consume-phase SLM read traffic with an almost
 // unchanged instruction stream. Produces wrong results; measurement only.
+//
+// Isolates consume-phase SLM *read volume*, which is the one cost that scales with
+// WG_THREADS: every thread reads the whole marshalled K/V tile, so the WG re-reads its own
+// 8 KiB WG_THREADS times per online tile. Every DPAS, the softmax and all register traffic
+// stay; only 7 of every 8 SLM read messages go away. Enable with -DABLATE_CONSUME_SLM=1.
+#ifndef ABLATE_CONSUME_SLM
+#define ABLATE_CONSUME_SLM 0
+#endif
+#ifndef ABLATE_EPILOGUE_WRITE
+#define ABLATE_EPILOGUE_WRITE 0
+#endif
+// Measurement only: drop both per-online-tile barriers. All work stays; only the
+// workgroup lockstep goes away. The marshal and the consume are barrier-separated
+// phases, so within a WG the DRAM load and the DPAS cannot overlap -- this measures
+// how much of the main kernel that serialisation costs, and therefore what
+// software-pipelining the marshal against the consume could recover. Wrong results.
+#ifndef ABLATE_NO_BARRIER
+#define ABLATE_NO_BARRIER 0
+#endif
+#ifndef ABLATE_NO_SOFTMAX
+#define ABLATE_NO_SOFTMAX 0
+#endif
+#ifndef ABLATE_NO_MARSHAL_ALU
+#define ABLATE_NO_MARSHAL_ALU 0
+#endif
+// Splits ABLATE_NO_MARSHAL_ALU in two, because only one half is bit-exact to optimise.
+// NO_TRANSPOSE keeps the dequantize and drops the dword transpose / VNNI interleave -- pure
+// data movement, so a real replacement (a hardware-transposing load, say) would not change a
+// single output bit. What is left of NO_MARSHAL_ALU after it is the dequantize arithmetic,
+// which cannot be restructured without changing rounding.
+#ifndef ABLATE_NO_TRANSPOSE
+#define ABLATE_NO_TRANSPOSE 0
+#endif
+
+// Fold the dequantize's subtract and multiply into one mad: (v - zp) * scale is
+// v * scale + (-zp * scale), and the second term does not depend on the token row, so it can
+// be built once per tile (or per chunk, for the per-channel layout) and the per-row work drops
+// from convert + sub + mul to convert + mad. The ablation ledger puts the whole dequantize at
+// 0.131 ms / 15.8 % of the main kernel at q_len=16, so a third of it is ~5 %.
+//
+// This is a rounding change, not a value change: both forms compute the same real number, but
+// the mad rounds v*scale and the sum rather than v-zp and the product.
+//
+// MEASURED, left off. Main kernel, container rig, off -> on, reproduced across repeats:
+//   q_len=6  part 512   0.521 -> 0.501  (-4.2 %)
+//   q_len=16 part 512   0.828 -> 0.822  (-0.9 %)
+//   q_len=16 part 1024  0.870 -> 0.850  (-2.3 %)
+// It is a consistent win, which retires the older "+1 to +3 %" verdict as a rig artifact -- but
+// the accuracy cost is not free. Across the 115-case correctness suite the worst max_diff is
+// unchanged at 2.44e-4, but the clean cases degrade from 1.53e-5 (22 of them) to ~3.1e-5 and
+// the distribution widens from 6 distinct values to 12. Doubling the typical error to buy
+// 0.9 % at the shape we care about is not a good trade; enable per-shape if ever wanted.
+//
+// The size of the win is itself the interesting result. Removing a third of the dequantize's
+// element work buys 0.9 % where removing all of the dequantize buys 16.9 %, which says the
+// marshal is bound by the latency of its dependent chain rather than by element throughput.
+// Two follow-ons were tested and both failed: giving each thread more independent chunk chains
+// to interleave (MARSHAL_TG_OVERRIDE below -- 8/4/2/1 -> 0.823/1.001/1.362/2.099, so maximum
+// marshal parallelism wins and the original note was right), and overlapping the chain with
+// the consume (PIPELINE_MARSHAL above -- register pressure eats it).
+#ifndef DEQUANT_MAD
+#define DEQUANT_MAD 0
+#endif
+
+// INVALID PROBE -- kept only so it is not re-invented. Intended to measure the DPAS share by
+// replacing the two systolic ops with plain adds, but the replacement is far more expensive
+// than what it replaces (0.826 -> 3.474 ms at q_len=16): adding half matrices into a float
+// accumulator costs conversions, and it breaks the systolic accumulator chain that lets
+// back-to-back dpas issue at full rate. It measures the cost of not using DPAS, not the cost
+// of using it. The DPAS share remains unmeasured.
+#ifndef ABLATE_NO_DPAS
+#define ABLATE_NO_DPAS 0
+#endif
+
+// Unroll factor for the online-tile loop. 0 keeps the unconditional #pragma unroll, which at
+// KV_PARTITION_SIZE 512 fully unrolls 32 copies of a body that itself contains three
+// 8-iteration unrolled chunk loops. That is a lot of instruction footprint, and PROFILING.md
+// round 3 already caught IGC spending freed register slack on more unrolling rather than on
+// speed. The tile index feeds vector subscripts (kv_pos_end_cache[ki] and friends), so rolling
+// the loop up trades code size against indirect register addressing.
+//
+// MEASURED, 4 adopted. With SOFTMAX_RESCALE 2 at q_len=16 / partition 512, factor
+// 0/2/3/4/5/6 gives 0.782/0.786/0.787/0.777/0.784/0.786 ms. Bit-exact -- an unroll factor
+// changes no arithmetic. The gain is small next to the rescale but free.
+#ifndef TILE_UNROLL
+#define TILE_UNROLL 4
+#endif
+
+// How the online-softmax accumulator rescale decides whether to run. All three forms are
+// bit-identical: new_max >= final_max always, so when a row does not need rescaling the
+// correction is cm_exp(0) == 2^0 == 1.0 exactly and multiplying by it changes nothing.
+//   0  per-row branch (original). ROWS_PER_THREAD scalar branches per thread per online tile,
+//      ~491k branch executions over the kernel at q_len=16.
+//   1  one whole-tile guard, per-row branches kept inside it. Skips all of them on tiles where
+//      no row's running max moved, which is the common case once a partition is warmed up.
+//   2  branchless: apply the correction to every row unconditionally. Deletes every branch but
+//      pays ROWS_PER_THREAD * (REG_N + HEAD_SIZE) multiplies per tile whether needed or not.
+//
+// MEASURED, form 2 adopted. Main kernel, q_len=16 / partition 512: 0.826 (form 0) -> 0.832
+// (form 1) -> 0.782 (form 2). Bit-exactness is not just argued but checked: the max_diff
+// distribution over the 115-case correctness suite is identical for forms 0 and 2, down to the
+// bucket counts (52/24/22/13/3/1). Form 1 loses because the cm_sum reduction costs more than
+// the branches it skips; form 2 wins even though it does ~85 % of its multiplies needlessly,
+// because on this machine the branches, not the multiplies, are what the rescale pays for.
+#ifndef SOFTMAX_RESCALE
+#define SOFTMAX_RESCALE 2
+#endif
 
 // Ablation probe, see the use site: make the whole K/V working set L1-resident by rotating
 // over 4 physical blocks. Isolates exposed DRAM latency/bandwidth from everything else.
@@ -164,7 +280,9 @@ namespace KERNEL_NAME {
 // independent batches, distance 2 = -6.5 %, distance 4 = -10.4 %. Distance 1 wins because
 // tile i's marshal, barrier and consume already cover a full DRAM round trip, and going
 // deeper only ages the line in L1. cm_prefetch cannot change results.
+#ifndef KV_PREFETCH_DIST
 #define KV_PREFETCH_DIST 1
+#endif
 
 // Fold the dequantize's subtract and multiply into one mad: (v - zp)*scale is
 // v*scale + (-zp*scale), and the second term is a per-token scalar that can be built once
@@ -197,7 +315,9 @@ namespace KERNEL_NAME {
 //     dequantize: both remove element work and both measure +1 to +3 %. At ~30 % ALU
 //     utilisation, ALU work is not what this kernel pays for.
 
+#ifndef KV_PREFETCH_DIST
 #define KV_PREFETCH_DIST 1
+#endif
 
 // Fold the dequantize's subtract and multiply into one mad: (v - zp)*scale is
 // v*scale + (-zp*scale), and the second term is a per-token scalar that can be built once
@@ -217,6 +337,84 @@ namespace KERNEL_NAME {
 // unchanged; only the message count drops. Separates "SLM bytes" from "SLM messages" as the
 // cost of the consume phase.
 
+// --- Measured ablation budget (container rig, 32 EU @2.45 GHz, cmpr=2, block 256,
+// partition 512, past 15360, min-of-N; the bare-metal host throttles ~2x over a session and
+// cannot resolve any of this). main kernel, ms:
+//
+//                       q_len=6 (3 thr)      q_len=16 (8 thr)
+//   baseline               0.523                0.826
+//   -7/8 consume SLM       0.501  (-4.2%)       0.760  (-8.0%)
+//   -7/8 epilogue writes   0.515  (-1.5%)       0.787  (-4.7%)
+//   -both barriers         0.459 (-12.6%)       0.754  (-8.9%)
+//   -softmax               0.478  (-8.3%)       0.749  (-9.2%)
+//   -transpose/VNNI only   0.488  (-6.5%)       0.818  (-1.1%)
+//   -dequant + transpose   0.398 (-23.8%)       0.687 (-16.9%)
+//
+// So the marshal's *dequantize* is the largest single addressable term at q_len=16: 0.13 ms,
+// 15.8 %, bigger than the barriers, the softmax, the consume SLM reads and the epilogue writes
+// individually. The transpose is only 1.1 % there and is not worth replacing on its own.
+// KV_PREFETCH_DIST is already optimal at 1 (dist 0/1/2/4 -> 0.987 / 0.825 / 0.833 / 0.862) and
+// so is the 192-register file (128/160/192/256 -> 1.861 / 0.927 / 0.832 / 0.963; 128 spills).
+//
+// This corrects the reading of F above: F is not all DRAM. ~0.13 of the 0.326 is marshal ALU,
+// leaving ~0.20 ms for 31.5 MB of KV. The DPAS term is genuinely at the roof -- 4.03 GFLOP of
+// real work over the ~0.25 ms it occupies is ~15 TFLOPS on 32 XVEs -- so the DPAS and the KV
+// read are both done; the dequantize is where the remaining time is.
+//
+// The two floors fit main = F + c*WG_THREADS with F = 0.326 ms and c = 0.051 ms/thread.
+// F is the per-WG KV read + marshal and is already at the memory roof: 31.5 MB in 0.33 ms
+// is 95 GB/s.
+//
+// That "at the memory roof" was an assertion for a long time, and it was being checked against
+// the WRONG roof -- the 132 GB/s sequential-stream figure from microbench/dram_bw.py, against
+// which 95-101 GB/s looks like 77 % and implies a fifth of the KV time is recoverable. It is
+// not. microbench/kv_pattern_bw.py now measures the roof for *this* access pattern (16 token
+// rows x 16 B at pitch 128, 256-token pages reached through an index indirection, prefetch
+// distance 1), on a 512 MiB working set:
+//
+//   stream (uint4)              128.4 GB/s
+//   2d-block seq   pf=0          79.6          62.0 % of stream
+//   2d-block paged pf=0          78.2          60.9 %
+//   2d-block seq   pf=1         101.5          79.0 %
+//   2d-block paged pf=1         106.0          82.6 %      <- the kernel's actual shape
+//
+// So the pattern's own roof is 101-106 GB/s and the kernel gets 95-101. The KV read is at
+// 95-100 % of what this access pattern can do; there is nothing left in it. Two side results
+// worth keeping: the paging indirection is free (shuffled page map is not slower than an
+// identity one), so the whole 22 % deficit versus streaming is the 16 B tile width, and the
+// prefetch is what recovers most of it (+28 %), which is why KV_PREFETCH_DIST=1 matters so
+// much above.
+//
+// Consequence for the gap: the floor is not 0.35 ms. KV at its achievable roof is ~0.32 and
+// the partial round trip ~0.10, so ~0.42, against 0.845 actual. The remaining time is entirely
+// the non-memory terms below -- dequantize, softmax, barrier lockstep, SLM reads -- and any
+// future attack should be aimed there and not at memory efficiency. This also explains the
+// three failed attempts on the barrier lockstep: they tried to hide work behind a memory
+// stream that had already been prefetched clear.
+//
+// So at tile_q == q_len there is no padding waste left to remove -- q_len=16
+// costs more than q_len=6 because it is 2.67x the q-rows, and it is already 1.6x cheaper
+// *per validated token* (0.058 vs 0.093 ms). What remains addressable is the ~0.19 ms of
+// barrier lockstep + softmax + partial-write traffic, not the DPAS and not the KV read.
+//
+// fp16 partials -- NOT ADOPTED, by choice rather than by measurement. Writing the partition
+// output as half would halve both the epilogue write (0.039 ms) and the reduce read
+// (0.099 ms), worth ~7.5 % of the pair at q_len=16 and ~3.5 % at q_len=6, with no occupancy
+// trade. It is numerically cheap: the partial is a convex combination of dequantized-u8 V, so
+// |O_p| <= max|V| and overflow is structurally impossible, and the extra rounding measured at
+// max 4.6e-6 / rms 1.0e-6 against an output range of +-0.019 -- 0.61x the max and 1.00x the
+// rms of the half rounding the final store already applies. End to end that is one fp16 ulp
+// (1.5e-5) on top of an existing reference max_diff of 1.2e-4, against a 0.05 tolerance.
+//
+// Declined anyway: the absolute error does not shrink when the cross-partition sum cancels, so
+// output elements near zero take a large *relative* error (1.8x their own value in the
+// measurement), and an accuracy regression of that shape is hard to attribute if it surfaces
+// in a real generation. If it is ever revisited: lse must stay f32 -- it is log-sum-exp with
+// magnitude in the hundreds and the partition weights depend on it exponentially, so half
+// there costs ~5 % per-partition weight error, which is a real regression rather than a ulp.
+// Measurement harness: fp16_partial_accuracy.py (rounds the kernel's own f32 partials and
+// re-runs the reduce both ways; no kernel change needed to reproduce).
+//
 // --- Ablation probes. All produce wrong results; measurement only. Each removes one
 // resource while leaving the values it feeds live and data-dependent, so IGC cannot fold
 // away the surrounding work (ablations must remove traffic while leaving values live).
@@ -254,7 +452,225 @@ namespace KERNEL_NAME {
 // consumes tile t-1 (skipped on the first). Slot t&1 is written while slot (t-1)&1 is read,
 // and slot t&1's previous reader was iteration t-1's consume of tile t-2, which the barrier
 // at the end of t-1 already ordered.
+// Software-pipeline the marshal against the consume: iteration t marshals tile t while
+// consuming tile t-1, so the 2D block load's DRAM latency overlaps the previous tile's DPAS
+// instead of sitting in front of it behind a barrier. Measured on the ablation ledger above:
+// the two barriers cost 8.9 % of the main kernel at q_len=16 and 12.6 % at q_len=6, and that
+// cost is the workgroup lockstep itself, not the barrier count -- so the only way to get it
+// back is to give the scheduler something to fill the marshal's dependent chain with.
+//
+// Needs two marshalled slots: tile t is written to slot t&1 while tile t-1 is read from slot
+// (t-1)&1. Slot t&1's previous reader was iteration t-1's consume of tile t-2, which the
+// barrier at the end of iteration t-1 already ordered -- so one barrier per iteration is
+// enough where the serial form needs two. Costs 8 -> 16 KiB of SLM per workgroup, which is
+// free here: residency is set by the register file, not by SLM.
+// MEASURED AND REJECTED -- default off. Correct (115/115 of the correctness suite, three
+// runs) but it does not pay. Container rig, cmpr=2, block 256, past 15360, main kernel ms,
+// serial -> pipelined, reproduced across repeats:
+//
+//   q_len=6  part 256   0.542 -> 0.719   (+33 %)
+//   q_len=6  part 512   0.521 -> 0.754   (+45 %)
+//   q_len=16 part 256   0.872 -> 0.869   ( -0.3 %)
+//   q_len=16 part 512   0.825 -> 0.799   ( -3.2 %)
+//   q_len=16 part 1024  0.866 -> 1.038   (+20 %)
+//
+// Re-measured later at part 640, which is the point that actually matters, plus a repeat of
+// 512 (harness/bench_pipeline_ab.py, min of 5 interleaved rounds, spread shown):
+//
+//   q_len=16 part 640   0.764 -> 0.779   (+1.9 %, spread 2.1 % -> unresolvable)
+//   q_len=16 part 512   0.773 -> 0.765   ( -1.1 %, spread 1.0 %)
+//   q_len=6  part 640   0.494 -> 0.731   (+48.1 %)
+//
+// So the crossover sits between 512 and 640, and the -3.2 % above is the best case, not a
+// typical one. THE REASON THIS STAYS OFF EVEN PER-RUNG: the rung mechanism would let q_len=16
+// (8 threads, 1 chunk each) opt in while q_len=6 (3 threads, 3 chunks each) stays out, and
+// that looks like free money in the table above -- but pick_small_q_partition never selects
+// 512. It picks 128 / 256 / 384 / 640, and pipelining is worth -0.3 % at 256 and +1.9 % at
+// 640. There is no operating point where the win region and the shipped partitions overlap.
+// Re-check this only if the partition rule changes.
+//
+// The barrier ablation says the lockstep is worth 8.9 % at q_len=16, but only ~1/3 of that
+// survives here, because interleaving the marshal with the consume keeps both working sets
+// live in the same iteration. The inflation scales with chunks-per-thread, which is
+// MARSHAL_CHUNKS_C / WG_THREADS -- 1 at q_len=16 (8 threads) but 3 at q_len=6 (3 threads),
+// which is why the short spec window is hurt three times as hard. Best-of-config totals are a
+// tie: 0.898 pipelined at part 512 against 0.904 serial at part 1024.
+//
+// This also explains the older, noisier verdict recorded above ("-4.1 % over 10 rounds and
+// +12.1 % over 14"): the sign genuinely depends on WG_THREADS and partition count, so a
+// paired A/B that mixes configurations cannot converge.
+#ifndef PIPELINE_MARSHAL
+#define PIPELINE_MARSHAL 0
+#endif
+
+#if PIPELINE_MARSHAL
+#define SLM_SLOTS 2
+#else
 #define SLM_SLOTS 1
+#endif
+
+// Split the pre-marshal barrier into its arrive and wait halves (cm_sbarrier(1)/cm_sbarrier(0)).
+//
+// The barrier ablation puts the workgroup lockstep at 8.9 % of the main kernel at q_len=16.
+// PIPELINE_MARSHAL attacked that by halving the barrier count and lost, because double
+// buffering keeps two tiles' worth of state live and the register pressure costs more than the
+// barrier saved. This attacks the same 8.9 % without touching the working set at all: the
+// barrier count and the marshalled buffer count are both unchanged, only the point at which a
+// thread blocks moves.
+//
+// Arrive stays where the full barrier was, at the top of the iteration. The wait moves down to
+// just before the first SLM write, so the K global load, its dequantize and the transpose --
+// none of which touch SLM -- issue while other threads are still finishing the previous tile's
+// consume. The long-latency global load is the whole point of the window.
+//
+// Moving the arrive *earlier* instead was considered and is not worth it: the last SLM read of
+// the consume is the V block read, and only one PV dpas separates it from the end of the
+// iteration, so there is nothing to overlap on that side.
+//
+// The other barrier (post-marshal, publishing the SLM writes) is left whole: between the last
+// SLM write and the first SLM read there is no independent work to put in the window.
+//
+// MEASURED AND REJECTED -- default off. Correct (29/29 of the tile_q=16 correctness cases),
+// and the sign is consistently favourable, but the size is not resolvable on this rig and is
+// nowhere near the 8.9 % it targets. harness/bench_flag_ab.py, main kernel ms, off -> on, at
+// the (context, partition) pairs pick_small_q_partition actually produces:
+//
+//   past 15360 part 640   0.769 -> 0.765   ( -0.5 %, spread 0.8 %)   15 rounds
+//   past  1024 part 256   0.067 -> 0.067   ( -0.7 %, spread 18.9 %)  15 rounds
+//   past   512 part 128   0.041 -> 0.041   ( -1.2 %, spread  1.9 %)  15 rounds
+//
+// Seven measurements across two sessions all landed negative, so there is probably a real
+// effect of order half a percent -- about a tenth of the lockstep cost it was aimed at. Short
+// contexts are dominated by launch and prologue rather than by barriers, which is why the
+// kernel is already down at 0.04 ms there.
+//
+// One hypothesis was tested and refuted: that KV_PREFETCH_DIST=1 had already hidden the load
+// latency this window exists to cover, making the two redundant. With prefetch disabled the
+// split barrier gets *worse*, not better (0.923 -> 0.971, +5.3 %), so whatever limits it, it
+// is not that. Left in the tree at default 0 because it is a distinct mechanism from
+// PIPELINE_MARSHAL -- it does not touch the working set -- and the negative result is worth
+// more than the diff.
+//
+// Note it is q_len=16 only by construction, not by choice: the wait sits inside the chunk
+// loop, so MARSHAL_CPT must be 1, which the gate below enforces at compile time. q_len=6 has
+// 3 threads for 8 chunks and cannot use this at all.
+#ifndef SPLIT_BARRIER
+#define SPLIT_BARRIER 0
+#endif
+
+// Issue V's prefetch in the K chunk loop instead of the V one, so both prefetch streams are in
+// flight at once.
+//
+// microbench/kv_pattern_bw.py measured the roof for this kernel's exact access pattern and then
+// varied how many independent 2D-block streams a thread drives, with prefetch distance 1
+// (512 MiB working set, 8 threads per group):
+//
+//   stream (uint4), for reference           133.3 GB/s
+//   one stream,  paged, prefetch off         80.0     60.0 % of stream
+//   two streams, paged, prefetch off         82.4     61.8 %
+//   one stream,  paged, prefetch on         109.1     81.9 %
+//   two streams, paged, prefetch on         133.0     99.8 %
+//
+// Two streams reach full streaming bandwidth where one reaches 82 %. Note the effect is
+// entirely in the prefetch -- with prefetch off, a second stream is worth nothing (80.0 ->
+// 82.4). So what the pattern is short of is memory-level parallelism in the *prefetch*, and a
+// second concurrent prefetch is enough to supply it.
+//
+// This is deliberately not the same thing as merging the K and V marshal bodies, which the
+// comment by the chunk loops rules out: that needs Kq/KtNormal/Kt_m and Vq/VmatNormal/Vt_m live
+// together and the kernel is already at 243/256 GRF. Moving only the prefetch costs zero
+// registers, because cm_prefetch has no destination operand.
+//
+// MEASURED AND REJECTED -- default off. It loses everywhere, and by more than the noise:
+//
+//   q=16 past 15360 part 640   0.766 -> 0.795   (+3.8 %)
+//   q=6  past 15360 part 640   0.491 -> 0.511   (+4.1 %)
+//   q=16 past  1024 part 256   0.067 -> 0.071   (+5.6 %)
+//   q=6  past  1024 part 256   0.051 -> 0.053   (+5.2 %)
+//
+// The microbench result does not transfer because this only reproduces half of it. There, both
+// the loads AND the prefetches of the two streams were concurrent; here only the prefetches
+// are, and V's load still sits behind the whole K body. So V's prefetch is effectively issued
+// at a longer distance, and the KV_PREFETCH_DIST sweep already showed distance 2 and 4 losing
+// to 1 (0.833 and 0.862 against 0.825) for exactly that reason -- the line ages out of L1
+// before the load that wants it. Getting the microbench's configuration needs V's *load*
+// hoisted too, which is MARSHAL_HOIST_V below.
+#ifndef MARSHAL_PREFETCH_BOTH
+#define MARSHAL_PREFETCH_BOTH 0
+#endif
+
+// Hoist V's load (and its prefetch) into the K chunk loop, leaving V's dequantize where it is.
+//
+// This is the configuration kv_pattern_bw.py actually measured at 133 GB/s: two independent
+// 2D-block loads issued back to back with nothing between them, both in flight, each with its
+// own prefetch. MARSHAL_PREFETCH_BOTH above moved only the prefetch and lost; the question this
+// answers is whether the load being concurrent is what the microbench was really showing.
+//
+// The register cost is one uint8 REG_K x REG_N tile -- 256 B, 2 GRF -- live across the K body,
+// not the whole V chain. That is what makes it different from merging the two loops outright.
+// It needs one chunk per thread so exactly one Vq is in flight, hence the MARSHAL_CPT gate.
+//
+// Mode 1 hoists the prefetch with the load; mode 2 hoists only the load. They separate two
+// effects that cancel: measured at q=16, main kernel ms, off -> on,
+//
+//   prefetch only (MARSHAL_PREFETCH_BOTH)   15360/640 +3.8 %   1024/256 +5.6 %
+//   load + prefetch (mode 1)                15360/640 +0.8 %   1024/256 +2.3 %
+//
+// so making the loads concurrent is worth roughly +3 points, and moving V's prefetch a whole
+// K body earlier costs roughly the same again by aging its line out of L1. Mode 2 exists to
+// keep the first without paying the second.
+//
+// ADOPTED as the default wherever the gate allows. Mode 2, 20 interleaved rounds, main kernel
+// ms, at the (context, partition) pairs pick_small_q_partition actually produces:
+//
+//   past 15360 part 640   0.765 -> 0.757   ( -1.1 %, spread 1.8 %)
+//   past  2048 part 384   0.135 -> 0.130   ( -3.5 %, spread 1.3 %)
+//   past  1024 part 256   0.067 -> 0.066   ( -1.8 %, spread 2.3 %)
+//   past   512 part 128   0.041 -> 0.040   ( -2.1 %, spread 4.3 %)
+//
+// Only the 384 row resolves above the spread on its own, but seven measurements across two
+// sessions were negative without exception and none of the four points regresses, which is
+// what "relatively optimal at every context" requires. Bit-exact: reordering a load changes
+// no value, and the 29 tile_q=16 correctness cases pass unchanged.
+//
+// No spill. The register dump on this stack does not report GRF counts in any parseable form,
+// but a spill on this kernel costs 2-5x (see ONLINE_TILE_STEPS), and all four points got
+// faster, so the extra 2 GRF fit.
+//
+// q_len=16 only, by construction rather than by choice -- q_len=6 has 3 threads for 8 chunks,
+// so MARSHAL_CPT is 3 and more than one Vq would have to be live. Unlike PIPELINE_MARSHAL,
+// whose win sat at a partition the rule never picks, this one is present at every partition
+// the rule does pick.
+#ifndef MARSHAL_HOIST_V
+#if MARSHAL_CPT == 1 && ONLINE_TILE_STEPS == 1
+#define MARSHAL_HOIST_V 2
+#else
+#define MARSHAL_HOIST_V 0
+#endif
+#endif
+#if MARSHAL_HOIST_V
+#if MARSHAL_CPT != 1 || ONLINE_TILE_STEPS != 1
+#error "MARSHAL_HOIST_V keeps one Vq live per thread; it needs MARSHAL_CPT == 1"
+#endif
+#if MARSHAL_PREFETCH_BOTH
+#error "MARSHAL_HOIST_V already moves V's prefetch into the K loop"
+#endif
+#endif
+#if SPLIT_BARRIER
+#if PIPELINE_MARSHAL
+#error "SPLIT_BARRIER and PIPELINE_MARSHAL both restructure the pre-marshal barrier"
+#endif
+// Every thread must reach the wait. Only `local_qg < MARSHAL_TG` is per-thread in the marshal
+// guard -- do_marshal and the ki_m bound are workgroup-uniform -- so requiring all threads to
+// marshal is what makes the split safe.
+#if MARSHAL_TG != WG_THREADS
+#error "SPLIT_BARRIER requires every thread to enter the marshal (MARSHAL_TG == WG_THREADS)"
+#endif
+// The wait sits inside the li_m and chunk loops, so both must run exactly once per arrive.
+#if MARSHAL_CPT != 1 || ONLINE_TILE_STEPS != 1
+#error "SPLIT_BARRIER needs MARSHAL_CPT == 1 and ONLINE_TILE_STEPS == 1"
+#endif
+#endif
 
 // Pin the online_tile unroll factor. On a kernel near the GRF ceiling IGC spends any freed
 // register slack on more unrolling, so a change that removes work can silently double the
@@ -622,14 +1038,44 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             }
 
 
+            // One extra iteration when pipelined: a prologue that only marshals tile 0 and a
+            // drain that only consumes the last tile.
+#if PIPELINE_MARSHAL
+            #define PA_TILE_LOOP_COUNT (NUM_ONLINE_TILES + 1)
+#else
+            #define PA_TILE_LOOP_COUNT NUM_ONLINE_TILES
+#endif
+#if TILE_UNROLL > 0
+            PA_PRAGMA_UNROLL(TILE_UNROLL)
+#else
             #pragma unroll
-            for (int online_tile = 0; online_tile < NUM_ONLINE_TILES; online_tile++) {
+#endif
+            for (int online_tile = 0; online_tile < PA_TILE_LOOP_COUNT; online_tile++) {
+#if PIPELINE_MARSHAL
+                // _m indices/slots name the tile being *marshalled* this iteration; the
+                // unsuffixed ones name the tile being *consumed*, which trails it by one.
+                const int ki_base = (online_tile - 1) * ONLINE_TILE_STEPS;
+                const int ki_base_m = online_tile * ONLINE_TILE_STEPS;
+                // (online_tile + 1) & 1 == (online_tile - 1) & 1 for online_tile >= 1, and is
+                // unread at online_tile == 0 where there is nothing to consume.
+                const uint slm_slot_k = (uint)((online_tile + 1) & 1) * KT_BYTES;
+                const uint slm_slot_v = (uint)((online_tile + 1) & 1) * VT_BYTES;
+                const uint slm_slot_k_m = (uint)(online_tile & 1) * KT_BYTES;
+                const uint slm_slot_v_m = (uint)(online_tile & 1) * VT_BYTES;
+                // online_tile is the unroll index, so both fold to compile-time constants and
+                // the prologue/epilogue iterations cost no branch.
+                const bool do_marshal = (online_tile < NUM_ONLINE_TILES);
+                const bool do_consume = (online_tile > 0);
+#else
                 const int ki_base = online_tile * ONLINE_TILE_STEPS;
                 const int ki_base_m = ki_base;
                 const uint slm_slot_k = 0;
                 const uint slm_slot_v = 0;
                 const uint slm_slot_k_m = slm_slot_k;
                 const uint slm_slot_v_m = slm_slot_v;
+                const bool do_marshal = true;
+                const bool do_consume = true;
+#endif
 
                 matrix<float, ROWS_PER_THREAD, ONLINE_TILE_STEPS * REG_N> rS_tile = 0;
                 matrix<half, ROWS_PER_THREAD, ONLINE_TILE_STEPS * REG_N> P_tile = 0;
@@ -637,8 +1083,14 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 // Pre-marshal barrier: with a single set of marshalled buffers this tile's
                 // writes must not overtake the previous tile's reads. Unnecessary once the
                 // marshalled buffers were double-buffered.
+#if !ABLATE_NO_BARRIER && !PIPELINE_MARSHAL
                 cm_fence(CM_LOCAL_BARRIER);
+#if SPLIT_BARRIER
+                cm_sbarrier(1);          // arrive; the wait is just before the first SLM write
+#else
                 cm_barrier();
+#endif
+#endif
 
 
                 // ---- Cooperative marshalling ------------------------------------------
@@ -650,12 +1102,19 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 // Only the first MARSHAL_TG threads marshal; the rest fall straight through
                 // to the barrier below. The barrier itself stays outside this guard so the
                 // whole workgroup still meets at it.
-                if (local_qg < MARSHAL_TG
+                if (do_marshal && local_qg < MARSHAL_TG
                    ) {
                 #pragma unroll
                 for (int li_m = 0; li_m < ONLINE_TILE_STEPS; li_m++) {
                     const int ki_m = ki_base_m + li_m;
                     if (ki_m >= KV_PARTITION_STEP_NUM) {
+#if SPLIT_BARRIER && !ABLATE_NO_BARRIER
+                        // Pair the arrive even on the skip path. This branch is
+                        // workgroup-uniform, so every thread takes it together -- but a thread
+                        // that arrives and never waits leaves the next iteration's barrier one
+                        // short, which hangs rather than producing a wrong answer.
+                        cm_sbarrier(0);
+#endif
                         continue;
                     }
 
@@ -743,9 +1202,25 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         v_zp.merge(v_zp_raw, lane_valid);
                     }
 
+#if DEQUANT_MAD
+                    // Hoisted out of the token-row loops below. Out-of-range tiles leave scale
+                    // and zp at 0, and v*0 + 0 == (v - 0)*0, so those tiles are unaffected.
+                    vector<half, REG_K> v_negzpscale = cm_mul<half>(v_zp, v_scale);
+                    v_negzpscale = (half)0.0f - v_negzpscale;
+#if KV_CACHE_COMPRESSION == 1
+                    vector<half, REG_N> k_negzpscale = cm_mul<half>(k_zp, k_scale);
+                    k_negzpscale = (half)0.0f - k_negzpscale;
+#endif
+#endif
+
                     // K and V marshalled in separate loops so their working sets do not
                     // have to be live at the same time — this kernel already sits at
                     // 243/256 GRF, so overlapping them spills.
+#if MARSHAL_HOIST_V
+                    // Filled by the K loop below, consumed by the V loop. One chunk per thread
+                    // (MARSHAL_CPT == 1, enforced at the define), so exactly one is live.
+                    matrix<uint8_t, REG_K, REG_N> Vq;
+#endif
                     #pragma nounroll
                     for (int c = local_qg; c < (int)MARSHAL_CHUNKS; c += MARSHAL_TG) {
                         const uint chunk_out = (li_m * MARSHAL_CHUNKS + c) * MARSHAL_CHUNK_BYTES;
@@ -771,6 +1246,50 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             pfK.set_block_y(tok_in_blk_next);
                             cm_prefetch(pfK);
                         }
+#if MARSHAL_PREFETCH_BOTH
+                        // V's prefetch issued here rather than in the V loop below, so that two
+                        // prefetches are in flight across the whole K body instead of one at a
+                        // time. See the note by the define: two concurrent 2D-block prefetch
+                        // streams reach full streaming bandwidth on this access pattern where
+                        // one reaches 82 % of it. Costs no registers -- a prefetch has no
+                        // destination -- which is what makes this different from merging the K
+                        // and V marshal bodies, which does not fit in the register file.
+                        {
+                            lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> pfV2(
+                                value + v_blk_next, KV_BLOCK_SIZE - 1,
+                                HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+                            pfV2.set_block_x(c * REG_N);
+                            pfV2.set_block_y(tok_in_blk_next);
+                            cm_prefetch(pfV2);
+                        }
+#endif
+#if MARSHAL_HOIST_V
+                        // V's load issued immediately after K's, with nothing in between, so
+                        // both are outstanding at once -- the configuration kv_pattern_bw.py
+                        // measured at full streaming bandwidth. The dequantize stays in the V
+                        // loop below; only the raw tile is carried across.
+                        {
+                            lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dVh(
+                                value + v_blk_base, KV_BLOCK_SIZE - 1,
+                                HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+                            b2dVh.set_block_x(c * REG_N);
+                            b2dVh.set_block_y(tok_in_blk);
+                            cm_load<lsc::Normal>(Vq.format<uint8_t>(), b2dVh);
+                        }
+#if MARSHAL_HOIST_V == 1
+                        // Mode 1 moves the prefetch up with the load. Mode 2 leaves it in the V
+                        // loop, so V's prefetch keeps its original distance -- the two effects
+                        // are separable and pull in opposite directions, see the define.
+                        {
+                            lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> pfVh(
+                                value + v_blk_next, KV_BLOCK_SIZE - 1,
+                                HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+                            pfVh.set_block_x(c * REG_N);
+                            pfVh.set_block_y(tok_in_blk_next);
+                            cm_prefetch(pfVh);
+                        }
+#endif
+#endif
 #if KV_CACHE_COMPRESSION == 2
                         // Per-channel scale/zp for exactly this chunk's REG_K channels, one
                         // vector per sub-block group. The metadata sits after the
@@ -800,10 +1319,26 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             }
                         }
 #endif
+#if DEQUANT_MAD && KV_CACHE_COMPRESSION == 2
+                        matrix<half, GROUPS_PER_TILE, REG_K> kc_negzpscale =
+                            cm_mul<half>(kc_zp, kc_scale);
+                        kc_negzpscale = (half)0.0f - kc_negzpscale;
+#endif
                         matrix<half, REG_N, REG_K> KtNormal = 0;
+#if ABLATE_NO_MARSHAL_ALU
+                        KtNormal.row(0) = Kq.row(0);   // keep the load live, drop the dequant
+#else
                         #pragma unroll
                         for (int col = 0; col < REG_N; col++) {
                             KtNormal.row(col) = Kq.row(col);
+#if DEQUANT_MAD
+#if KV_CACHE_COMPRESSION == 2
+                            KtNormal.row(col) = KtNormal.row(col) * kc_scale.row(col / SUB_BLOCK_SIZE)
+                                              + kc_negzpscale.row(col / SUB_BLOCK_SIZE);
+#else
+                            KtNormal.row(col) = KtNormal.row(col) * k_scale[col] + k_negzpscale[col];
+#endif
+#else
 #if KV_CACHE_COMPRESSION == 2
                             // Per channel: the scale/zp vector spans the row (the REG_K
                             // channels of this chunk) and is shared by every token row of
@@ -819,14 +1354,30 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             KtNormal.row(col) = KtNormal.row(col) - k_zp[col];
                             KtNormal.row(col) = cm_mul<half>(KtNormal.row(col), k_scale[col]);
 #endif
+#endif
                         }
+#endif
                         matrix<half, REG_K, REG_N> Kt_m = 0;
+#if ABLATE_NO_MARSHAL_ALU
+                        Kt_m.row(0) = KtNormal.row(0);   // keep the SLM write live
+#elif ABLATE_NO_TRANSPOSE
+                        // Same 512 bytes in and out, one move instead of 32.
+                        Kt_m.format<uint8_t>() = KtNormal.format<uint8_t>();
+#else
                         Transpose_8x8(
                             KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(0,0),
                             Kt_m.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
                         Transpose_8x8(
                             KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(8,0),
                             Kt_m.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
+#endif
+#if SPLIT_BARRIER && !ABLATE_NO_BARRIER
+                        // Wait half of the arrive at the top of the iteration. The K load,
+                        // dequantize and transpose above ran inside the window. This is the
+                        // latest the wait can legally go: the first SLM write is the first
+                        // thing that needs the whole workgroup to have stopped reading.
+                        cm_sbarrier(0);
+#endif
                         auto Kt_bytes = Kt_m.format<uint8_t>();
                         #pragma unroll
                         for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
@@ -840,6 +1391,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         const uint chunk_out = (li_m * MARSHAL_CHUNKS + c) * MARSHAL_CHUNK_BYTES;
 
                         // V: dequantize token rows, then VNNI-interleave row pairs.
+#if !MARSHAL_HOIST_V
                         matrix<uint8_t, REG_K, REG_N> Vq;
                         {
                             lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(
@@ -849,6 +1401,8 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             b2dV.set_block_y(tok_in_blk);
                             cm_load<lsc::Normal>(Vq.format<uint8_t>(), b2dV);
                         }
+#endif
+#if !MARSHAL_PREFETCH_BOTH && MARSHAL_HOIST_V != 1
                         {
                             lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> pfV(
                                 value + v_blk_next, KV_BLOCK_SIZE - 1,
@@ -857,16 +1411,31 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             pfV.set_block_y(tok_in_blk_next);
                             cm_prefetch(pfV);
                         }
+#endif
                         matrix<half, REG_K, REG_N> VmatNormal = 0;
+#if ABLATE_NO_MARSHAL_ALU
+                        VmatNormal[0] = Vq.row(0);
+                        matrix<half, REG_K/2, REG_N*2> Vmat_m = 0;
+                        Vmat_m.row(0).select<REG_N, 1>(0) = VmatNormal.row(0);
+#else
                         #pragma unroll
                         for (int r = 0; r < REG_K; r++) {
                             VmatNormal[r] = Vq.row(r);
+#if DEQUANT_MAD
+                            VmatNormal[r] = VmatNormal[r] * v_scale[r] + v_negzpscale[r];
+#else
                             VmatNormal[r] = VmatNormal[r] - v_zp[r];
                             VmatNormal[r] = cm_mul<half>(VmatNormal[r], v_scale[r]);
+#endif
                         }
                         matrix<half, REG_K/2, REG_N*2> Vmat_m;
+#if ABLATE_NO_TRANSPOSE
+                        Vmat_m.format<uint8_t>() = VmatNormal.format<uint8_t>();
+#else
                         Vmat_m.select<REG_K/2, 1, REG_N, 2>(0, 0) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(0, 0);
                         Vmat_m.select<REG_K/2, 1, REG_N, 2>(0, 1) = VmatNormal.select<REG_K/2, 2, REG_N, 1>(1, 0);
+#endif
+#endif
                         auto Vt_bytes = Vmat_m.format<uint8_t>();
                         #pragma unroll
                         for (int x = 0; x < (int)MARSHAL_XFERS; x++) {
@@ -876,9 +1445,12 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     }
                 }
                 } /* local_qg < MARSHAL_TG */
+#if !ABLATE_NO_BARRIER && !PIPELINE_MARSHAL
                 cm_slm_fence(CM_LOCAL_BARRIER);
                 cm_barrier();
+#endif
 
+                if (do_consume) {
                 #pragma unroll
                 for (int li = 0; li < ONLINE_TILE_STEPS; li++) {
                     const int ki = ki_base + li;
@@ -891,11 +1463,21 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     // loop spilled, but that was with the row-major layout, where each
                     // unrolled copy needed its own gathered Qmat_data temporary; with
                     // chunk-major there are no temporaries and GRF *drops* (154 -> 148).
+#if ABLATE_CONSUME_SLM
+                    // Hoisted only for the ablation, so chunk 0 survives across iterations.
+                    // Hoisting it unconditionally widens Kt's live range and measurably slows
+                    // the real kernel, so the non-ablated path must keep it loop-local.
+                    matrix<half, REG_K, REG_N> Kt;
+#endif
                     #pragma unroll
                     for (int k = 0, ri = 0; k < HEAD_SIZE / REG_K; k += 1, ri++) {
                         // Already dequantized, transposed and VNNI-packed by the marshalling
                         // stage — read the DPAS operand straight out of SLM.
+#if !ABLATE_CONSUME_SLM
                         matrix<half, REG_K, REG_N> Kt;
+#else
+                        if (ri == 0)   // ri is a compile-time unroll index, so this folds
+#endif
                         {
                             auto Kt_in = Kt.format<uint8_t>();
                             const uint chunk_in = (li * MARSHAL_CHUNKS + ri) * MARSHAL_CHUNK_BYTES;
@@ -913,10 +1495,15 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         // per head-dim chunk, and breaks the systolic accumulator chain
                         // that lets back-to-back dpas issue at full rate.
                         auto rS_acc = rS_tile.select<ROWS_PER_THREAD, 1, REG_N, 1>(0, li * REG_N);
+#if ABLATE_NO_DPAS
+                        rS_acc = rS_acc + Kt.select<ROWS_PER_THREAD, 1, REG_N, 1>(0, 0)
+                                        + Qmat_data.select<ROWS_PER_THREAD, 1, REG_K, 1>(0, 0);
+#else
                         rS_acc = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, ROWS_PER_THREAD>(
                                     rS_acc.format<float>(),
                                     Kt.format<int32_t>(),
                                     Qmat_data.format<int32_t>());
+#endif
                     }
                 }
 
@@ -969,11 +1556,40 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 // data-dependent per row.
                 {
                     constexpr int SM_N = ONLINE_TILE_STEPS * REG_N;
+#if ABLATE_NO_SOFTMAX
+                    // Measurement only: keep rS live and P fed from it, drop the row-max tree,
+                    // the per-row rescale guards and the exponentials. Isolates the softmax
+                    // share of the per-thread consume cost, i.e. how much of it is something
+                    // other than DPAS. Wrong results.
+                    final_sum_acc.format<float>() += rS_tile.format<float>();
+                    P_tile.format<half>() = rS_tile.format<float>();
+                    final_max = cm_max<float>(final_max, rS_tile.column(0));
+                }
+                if (false) {
+                    constexpr int SM_N = ONLINE_TILE_STEPS * REG_N;
+#endif
                     vector<float, ROWS_PER_THREAD> tile_max =
                         MatRowMax<ROWS_PER_THREAD, SM_N>::apply(
                             rS_tile.select<ROWS_PER_THREAD, 1, SM_N, 1>(0, 0));
                     vector<float, ROWS_PER_THREAD> new_max = cm_max<float>(final_max, tile_max);
 
+#if SOFTMAX_RESCALE == 2
+                    // new_max - final_max >= 0, so this is <= 0 and the exp is <= 1; it is
+                    // exactly 1.0 for rows that did not move.
+                    vector<float, ROWS_PER_THREAD> correction_v =
+                        cm_exp((final_max - new_max) * log2e_wg);
+                    #pragma unroll
+                    for (int row = 0; row < ROWS_PER_THREAD; row++) {
+                        final_sum_acc.row(row) *= correction_v[row];
+                        Omat.select<HEAD_SIZE / REG_N, 1, REG_N, 1>(0, row * REG_N) *= correction_v[row];
+                    }
+#else
+#if SOFTMAX_RESCALE == 1
+                    // Every term of new_max - final_max is >= 0, so the sum is > 0 exactly when
+                    // at least one row moved. One scalar test instead of ROWS_PER_THREAD.
+                    if (cm_sum<float>(new_max - final_max) > 0.0f)
+#endif
+                    {
                     #pragma unroll
                     for (int row = 0; row < ROWS_PER_THREAD; row++) {
                         if (tile_max[row] > final_max[row])
@@ -984,6 +1600,8 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                             Omat.select<HEAD_SIZE / REG_N, 1, REG_N, 1>(0, row * REG_N) *= correction;
                         }
                     }
+                    }
+#endif
                     final_max = new_max;
 
                     vector<float, ROWS_PER_THREAD * SM_N> shifted =
@@ -1001,9 +1619,16 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         continue;
                     }
 
+#if ABLATE_CONSUME_SLM
+                    matrix<half, REG_K/2, REG_N*2> Vmat;
+#endif
                     #pragma unroll
                     for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
+#if !ABLATE_CONSUME_SLM
                         matrix<half, REG_K/2, REG_N*2> Vmat;
+#else
+                        if (ri == 0)   // ri is a compile-time unroll index, so this folds
+#endif
                         {
                             auto Vt_in = Vmat.format<uint8_t>();
                             const uint chunk_in = (li_v * MARSHAL_CHUNKS + ri) * MARSHAL_CHUNK_BYTES;
@@ -1018,20 +1643,31 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                         matrix<half, ROWS_PER_THREAD, REG_K> Pmat_data =
                             P_tile.select<ROWS_PER_THREAD, 1, REG_K, 1>(0, li_v * REG_N);
                         auto Omat_data = Omat[ri].format<float, ROWS_PER_THREAD, REG_N>();
+#if ABLATE_NO_DPAS
+                        Omat_data = Omat_data + Vmat.select<ROWS_PER_THREAD, 1, REG_N, 1>(0, 0)
+                                              + Pmat_data.select<ROWS_PER_THREAD, 1, REG_N, 1>(0, 0);
+#else
                         Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, ROWS_PER_THREAD>(
                                     Omat_data.format<float>(),
                                     Vmat.format<int32_t>(),
                                     Pmat_data.format<int32_t>());
+#endif
                     }
                 }
 
-                // No barrier here. All threads must finish consuming slm_Kt / slm_Vt before
-                // the next iteration's marshal overwrites them, but the barrier at the top
-                // of the loop body already guarantees exactly that, and with the raw-staging
-                // block gone the two used to sit back to back with nothing in between. Two
-                // 10-12 round A/Bs put the removal at -3.6 % and -1.1 %; call it ~2 %, which
-                // is at this rig's resolution limit, but it never measured positive and it
-                // deletes a synchronisation point that provably separated nothing.
+                } /* do_consume */
+
+#if !ABLATE_NO_BARRIER && PIPELINE_MARSHAL
+                // The only barrier in the pipelined form. It publishes this iteration's
+                // marshal of slot online_tile&1 to the next iteration's consume, and it orders
+                // this iteration's consume of slot (online_tile-1)&1 ahead of iteration
+                // online_tile+1's marshal, which reuses that same slot.
+                cm_slm_fence(CM_LOCAL_BARRIER);
+                cm_barrier();
+#endif
+                // Serial form ends with no barrier: every thread must finish consuming
+                // slm_Kt / slm_Vt before the next iteration's marshal overwrites them, but the
+                // barrier at the top of the loop body already guarantees exactly that.
             }
         }
 
@@ -1050,6 +1686,14 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 
         #pragma unroll
         for (int row = 0; row < ROWS_PER_THREAD; row++) {
+#if ABLATE_EPILOGUE_WRITE
+            // Measurement only: keep row 0's partial write, drop the other seven. Isolates the
+            // epilogue's DRAM write volume, which is the term that scales with q_len
+            // (q_len * heads * partitions * head_size * 4 bytes, written here and read back by
+            // the reduce kernel). `row` is a compile-time unroll index, so this folds. Omat
+            // still comes out of the DPAS chain, so nothing upstream is dead. Wrong results.
+            if (row != 0) continue;
+#endif
             const int global_row = subgroup_row_base + row;
             const int t = global_row / Q_head_chunk_size;
             const int qi = global_row % Q_head_chunk_size;
